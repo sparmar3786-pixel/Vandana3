@@ -49,36 +49,6 @@ class NSEClient:
             (d["CE"]["underlyingValue"] for d in rec["data"] if d.get("CE")), 0))
         return {"ts": time.time(), "spot": spot, "expiry": expiry, "rows": rows}
 
-    def index_components(self, index="NIFTY 50"):
-        aliases={
-            "NIFTY":"NIFTY 50",
-            "NIFTY 50":"NIFTY 50",
-            "BANK NIFTY":"NIFTY BANK",
-            "BANKNIFTY":"NIFTY BANK",
-            "FINNIFTY":"NIFTY FIN SERVICE",
-            "MIDCPNIFTY":"NIFTY MIDCAP SELECT",
-        }
-        name=aliases.get(index.upper(), index.upper())
-        j=self._get(BASE + "/api/equity-stockIndices?index=" + requests.utils.quote(name))
-        data=j.get("data",[]) if isinstance(j,dict) else []
-        rows=[]
-        for x in data:
-            if not isinstance(x,dict): continue
-            rows.append({
-                "symbol":x.get("symbol"),
-                "name":x.get("meta",{}).get("companyName") if isinstance(x.get("meta"),dict) else x.get("symbol"),
-                "lastPrice":x.get("lastPrice"),
-                "change":x.get("change"),
-                "pChange":x.get("pChange"),
-                "previousClose":x.get("previousClose"),
-                "open":x.get("open"),
-                "dayHigh":x.get("dayHigh"),
-                "dayLow":x.get("dayLow"),
-                "totalTradedVolume":x.get("totalTradedVolume"),
-                "isFnoSec":x.get("isFnoSec"),
-            })
-        return {"index":name,"rows":rows,"ts":time.time()}
-
     @staticmethod
     def _leg(x):
         x = x or {}
