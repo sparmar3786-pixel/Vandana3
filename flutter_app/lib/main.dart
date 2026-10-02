@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:math' as math;
 import 'package:flutter/material.dart';
+import 'package:flutter_svg/flutter_svg.dart';
 import 'package:http/http.dart' as http;
 import 'package:file_saver/file_saver.dart';
 
@@ -221,7 +222,9 @@ class _TerminalState extends State<Terminal> {
 
   Widget dashboard() {
     final action = signal?['action']?.toString() ?? 'WAIT';
+    final heroGraphic = ClipRRect(borderRadius: BorderRadius.circular(22), child: SvgPicture.asset('assets/market_hero.svg', height: 150, width: double.infinity, fit: BoxFit.cover));
     return ListView(padding: const EdgeInsets.fromLTRB(12,10,12,20), children: <Widget>[
+      heroGraphic,
       Card(child: Padding(padding: const EdgeInsets.all(14), child: Row(children: <Widget>[
         const CircleAvatar(radius:22,child:Icon(Icons.candlestick_chart)),
         const SizedBox(width:10),
