@@ -1402,7 +1402,7 @@ class _AngelApiFormState extends State<AngelApiForm> {
     }
 
     setState(() => busy = true);
-    widget.onStatus('Connecting to Angel One SmartAPI securely through Vandana3 backend...');
+    widget.onStatus('Connecting to Angel One SmartAPI securely through Vandana2 backend...');
 
     try {
       final response = await http.post(
@@ -1545,7 +1545,7 @@ class _AngelApiFormState extends State<AngelApiForm> {
               ],
               const SizedBox(height: 8),
               Text(
-                'Vandana3 backend → Angel One SmartAPI → JWT + Feed Token → WebSocket 2.0',
+                'Vandana2 backend → Angel One SmartAPI → JWT + Feed Token → WebSocket 2.0',
                 style: TextStyle(color: Theme.of(context).colorScheme.primary),
               ),
             ],
