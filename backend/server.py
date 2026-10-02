@@ -11,17 +11,14 @@ from signals import Engine
 from nse_client import NSEClient
 import nse_features
 from nse_mcp import NSEMCP,result_to_csv
-from ai_model import p_up,label
-from ai_orchestrator import provider_status, validate_all, NSE_SITE_URL, _nse_site_evidence
 from market_core import router as market_core_router, ingest_chain, put_spot, evidence as market_evidence, mount_mcp, install_mcp_auth
 from strategy_api import router as strategy_router
-from council import router as council_router
 from notifier import router as alert_router, alert_loop
 from strategy_store import save_oi_snapshot
 from strategy_mcp_server import mount_strategy_mcp
 from engine_contract import engine_state, strategy_state
 
-app=FastAPI(title="NSE Algo Signal API"); app.add_middleware(GZipMiddleware,minimum_size=1024); app.include_router(strategy_router); app.include_router(market_core_router); app.include_router(council_router); app.include_router(alert_router); eng=Engine(); client=AngelClient(); nse=NSEClient(); nse_mcp=NSEMCP()
+app=FastAPI(title="NSE Algo Signal API"); app.add_middleware(GZipMiddleware,minimum_size=1024); app.include_router(strategy_router); app.include_router(market_core_router); app.include_router(alert_router); eng=Engine(); client=AngelClient(); nse=NSEClient(); nse_mcp=NSEMCP()
 state={"error":None,"nse_error":None,"last_update":None,"angel_message":"Not connected","nse_mcp_error":None,"nse_mcp_checked":False}
 prev_chain={"c":None}; workers_started=False; last_oi_save=0.0
 
@@ -30,9 +27,6 @@ prev_chain={"c":None}; workers_started=False; last_oi_save=0.0
 mount_mcp(app)
 mount_strategy_mcp(app)
 install_mcp_auth(app)
-
-class AIValidationRequest(BaseModel):
-    payload:dict = {}
 
 class AngelLoginRequest(BaseModel):
     # The APK uses clientId/pin/totp/apiKey. clientCode is accepted as a
@@ -336,47 +330,6 @@ def _strategy_refresh(index: str = "NIFTY"):
 def strategy_refresh(index:str="NIFTY",x_token:str=Header(None)):
     auth(x_token)
     return _strategy_refresh(index)
-
-@app.get("/v1/ai/context")
-def ai_context(index:str="NIFTY",x_token:str=Header(None)):
-    auth(x_token)
-    terminal=terminal_snapshot()
-    try:
-        mcp=nse_mcp.context(index.upper())
-        state["nse_mcp_checked"]=True
-        state["nse_mcp_error"]=None
-    except Exception as e:
-        mcp={"connected":False,"endpoint":nse_mcp.url,"tool_count":0,"tools":[],"data":[],"error":str(e)[:500]}
-        state["nse_mcp_checked"]=True
-        state["nse_mcp_error"]=str(e)
-    official=_nse_site_evidence({"terminal":terminal,"symbol":index})
-    strategy=_strategy_refresh(index)
-    market=terminal.get("market") or {}
-    return {"terminal":terminal,"strategy":strategy,"three_sources":{
-        "angel_api":{"connected":bool((terminal.get("angel_api") or {}).get("connected")),"data":terminal.get("data"),"option_chain":terminal.get("option_chain")},
-        "nse_mcp":mcp,
-        "nse_internet":{"connected":official.get("connected",False),"evidence":official}
-    },"market_evidence":{
-        "index":index.upper(),"spot":market.get("spot"),"atm":market.get("atm"),
-        "pcr":strategy.get("pcr"),"top_ce_oi":strategy.get("highest_ce_oi",[]),"top_pe_oi":strategy.get("highest_pe_oi",[]),
-        "trend":strategy.get("trend"),"support":strategy.get("support"),"resistance":strategy.get("resistance"),
-        "max_pain":strategy.get("max_pain")
-    },"ai_rule":"Reconcile Angel API + official NSE MCP + Internet evidence. Missing or conflicting evidence forces WAIT."}
-@app.post("/v1/ai/validate")
-def ai_validate(body:AIValidationRequest,x_token:str=Header(None)):
-    auth(x_token)
-    payload=body.payload if isinstance(body.payload,dict) else {}
-    try:
-        return validate_all(payload)
-    except Exception as e:
-        return {"final":"WAIT","cross_verified":False,"reason":"AI orchestration failed safely; local evidence path remains active.",
-                "configured":0,"successful":0,"parsed_states":0,"total":6,"providers":[],
-                "local_fallback":{"status":"error_local","text":str(e)[:300]}}
-
-@app.get("/v1/diagnostics")
-def diagnostics(x_token:str=Header(None)):
-    auth(x_token); providers=ai_status(x_token)["providers"]; ev=getattr(eng,"strategy_evidence",[]) if hasattr(eng,"strategy_evidence") else []
-    return {"angel":{"connected":client.api is not None,"message":state["angel_message"]},"nse":{"available":state["nse_error"] is None,"error":state["nse_error"]},"ai":{"configured":sum(1 for p in providers if p["configured"]),"providers":providers},"strategies":{"registered":len(ev),"evaluated":len(ev),"active":sum(1 for x in ev if isinstance(x,dict) and x.get("state")=="active"),"unavailable":sum(1 for x in ev if isinstance(x,dict) and x.get("state")=="unavailable"),"not_evaluated":0}}
 
 @app.get("/v1/audit/latest")
 def latest_audit(x_token:str=Header(None)):
