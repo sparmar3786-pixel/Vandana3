@@ -200,7 +200,7 @@ class _TerminalState extends State<Terminal> {
     if (selected == 16) return settingsPage();
     if (selected == 17) return morePage();
     if (selected == 18) return strategiesPage();
-    if (selected == 20) return systemHealthPage();
+    if (selected == 19) return systemHealthPage();
     return dataPage(screens[selected]);
   }
 
@@ -990,7 +990,7 @@ class _TerminalState extends State<Terminal> {
     const SizedBox(height: 12),
     infoCard('Order mode','No order placement. Live market workspace.',Colors.orange),
     infoCard('Security','Keep Angel credentials server-side and never commit secrets.',Colors.blue),
-    Card(child:ListTile(leading:const Icon(Icons.health_and_safety),title:const Text('System Health & Audit'),subtitle:const Text('Feed freshness • strategy evaluation • latest signal evidence'),trailing:const Icon(Icons.chevron_right),onTap:()=>setState(()=>selected=20))),
+    Card(child:ListTile(leading:const Icon(Icons.health_and_safety),title:const Text('System Health & Audit'),subtitle:const Text('Feed freshness • strategy evaluation • latest signal evidence'),trailing:const Icon(Icons.chevron_right),onTap:()=>setState(()=>selected=19))),
     infoCard('Navigation',screens.join(', '),Colors.blue),
   ]);
 
