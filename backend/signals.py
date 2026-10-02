@@ -4,7 +4,6 @@ from collections import deque
 import numpy as np
 import config as C
 import ai_model
-from strategy_registry import ALL_STRATEGIES, evaluate_strategies
 
 NSE_LOG = "data/nse_features.csv"
 
@@ -33,7 +32,6 @@ class Engine:
         self.nse = None
         self.nse_view = None
         self.last = {"action": "WAIT", "reasons": ["Warming up... data collect ho raha hai"]}
-        self.strategy_evidence = []
 
     def set_nse(self, f, ts):
         p, src = ai_model.p_up(f)
@@ -77,15 +75,6 @@ class Engine:
             rows.append((strike, typ, cls, round(dp, 2), int(doi)))
         if w_sum == 0: return self.last
 
-        strategy_rows = []
-        for strike in strikes:
-            ce = snap["opts"].get((strike, "CE"), {})
-            pe = snap["opts"].get((strike, "PE"), {})
-            old_ce = base["opts"].get((strike, "CE"), {})
-            old_pe = base["opts"].get((strike, "PE"), {})
-            strategy_rows.append({"strike": strike, "ce": {**ce, "prev_ltp": old_ce.get("ltp"), "prev_oi": old_ce.get("oi")}, "pe": {**pe, "prev_ltp": old_pe.get("ltp"), "prev_oi": old_pe.get("oi")}})
-        self.strategy_evidence = evaluate_strategies({"spot": snap["spot"], "rows": strategy_rows, "timestamp": now})
-
         oi_score = score_sum / w_sum
         pcr = pe_oi / ce_oi if ce_oi else 1.0
         pcr_sig = 1 if pcr > 1.2 else -1 if pcr < 0.8 else 0
@@ -119,10 +108,10 @@ class Engine:
                 elif ai_flip: reason = "NSE AI TREND FLIPPED"
                 pnl = round((ltp / p["entry"] - 1) * 100, 2)
                 if reason:
-                    self.last = {"action": "EXIT", "strike": p["strike"], "type": p["typ"], "ltp": ltp,
+                    self.last = {"action": "EXIT", "symbol": snap.get("symbol", C.SYMBOL), "optionSymbol": p.get("optionSymbol"), "strike": p["strike"], "type": p["typ"], "ltp": ltp,
                                  "pnl_pct": pnl, "reasons": [reason] + reasons, **self._meta(snap, score)}
                     self.position = None; return self.last
-                self.last = {"action": "HOLD", "strike": p["strike"], "type": p["typ"], "entry": p["entry"],
+                self.last = {"action": "HOLD", "symbol": snap.get("symbol", C.SYMBOL), "optionSymbol": p.get("optionSymbol"), "strike": p["strike"], "type": p["typ"], "entry": p["entry"],
                              "ltp": ltp, "sl": p["sl"], "target": p["target"], "pnl_pct": pnl,
                              "reasons": reasons, **self._meta(snap, score)}
                 return self.last
@@ -146,7 +135,7 @@ class Engine:
                 entry = opt["ltp"]
                 sl = round(entry * (1 - C.SL_PCT), 2); tgt = round(entry * (1 + C.SL_PCT * C.RR), 2)
                 self.position = {"strike": atm, "typ": typ, "entry": entry, "sl": sl, "target": tgt}
-                self.last = {"action": f"BUY_{typ}", "strike": atm, "type": typ, "entry": entry, "sl": sl,
+                self.last = {"action": f"BUY_{typ}", "symbol": snap.get("symbol", C.SYMBOL), "optionSymbol": opt.get("symbol"), "strike": atm, "type": typ, "ltp": entry, "entry": entry, "sl": sl,
                              "target": tgt, "ai_confidence": round(conf, 3), "reasons": reasons,
                              "exit_rule": "SL / Target / Angel reversal / NSE-AI flip", **self._meta(snap, score)}
                 return self.last
@@ -154,4 +143,12 @@ class Engine:
         return self.last
 
     def _meta(self, snap, score):
-        return {"spot": snap["spot"], "atm": snap["atm"], "score": round(score, 3), "ts": snap["ts"], "strategy_registry_count": len(ALL_STRATEGIES), "strategy_evidence": self.strategy_evidence}
+        opt = None
+        for typ in ("CE","PE"):
+            candidate = snap.get("opts", {}).get((snap.get("atm"), typ))
+            if candidate:
+                opt = candidate
+                break
+        return {"spot": snap["spot"], "atm": snap["atm"], "score": round(score, 3), "ts": snap["ts"],
+                "underlying": C.SYMBOL, "optionSymbol": (opt or {}).get("symbol"),
+                "optionToken": (opt or {}).get("token"), "ltp": (opt or {}).get("ltp")}

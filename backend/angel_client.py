@@ -1,594 +1,435 @@
-"""Angel One SmartAPI client for Vandana2.
-
-Authentication is server-side:
-Client ID + PIN/MPIN + current TOTP + SmartAPI API key
-    -> loginByPassword
-    -> JWT + refresh token + feed token
-    -> SmartConnect for REST APIs
-    -> SmartWebSocketV2 for live ticks
-
-No order-placement method is exposed by this client.
-"""
-import datetime as dt
-import json
-import os
-import threading
-import time
-import urllib.request
-from typing import Callable, Optional
-
+"""Angel One SmartAPI wrapper: login, option-chain tokens, live LTP/OI snapshots."""
+import json, os, time, urllib.request, datetime as dt, threading
 import pyotp
-import requests
 from SmartApi import SmartConnect
 from SmartApi.smartWebSocketV2 import SmartWebSocketV2
-
 import config as C
 
-MASTER_URL = "https://margincalculator.angelone.in/OpenAPI_File/files/OpenAPIScripMaster.json"
-LOGIN_URL = "https://apiconnect.angelone.in/rest/auth/angelbroking/user/v1/loginByPassword"
-TOKEN_URL = "https://apiconnect.angelone.in/rest/auth/angelbroking/jwt/v1/generateTokens"
-
-INDEX = {
-    "NIFTY": ("NSE", "99926000"),
-    "BANKNIFTY": ("NSE", "99926009"),
-    "FINNIFTY": ("NSE", "99926037"),
-    "MIDCPNIFTY": ("NSE", "99926074"),
-    "SENSEX": ("BSE", "99919000"),
-    "BANKEX": ("BSE", "99919012"),
-}
-EXCHANGE_TYPE = {"NSE": 1, "NFO": 2, "BSE": 3, "BFO": 4, "MCX": 5}
-CACHE = "scrip_master.json"
-
+MASTER_URL="https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json"
+INDEX={"NIFTY":"99926000","BANKNIFTY":"99926009","FINNIFTY":"99926037","SENSEX":"99919000"}
+CACHE="scrip_master.json"
 
 class AngelClient:
     def __init__(self):
-        self.api = None
-        self.api_key = C.API_KEY
-        self.client_code = C.CLIENT
-        self.pin = C.PIN
-        self.totp_secret = C.TOTP_SECRET
-        self.refresh_token = None
-        self.feed_token = None
-        self.login_at = None
-        self.last_error = None
-        self.chain = {}
-        self.strikes = []
-        self.expiry = None
-        self.prev_oi = {}
-        self.live_ticks = {}
-        self.live_connected = False
-        self.live_last_tick = None
-        self.live_error = None
-        self._ws = None
-        self._ws_thread = None
-        self._ws_stop = threading.Event()
-        self._ws_lock = threading.Lock()
-
-    # ---------- authentication ----------
-
-    def _headers(self, api_key: str, public_ip: str = "127.0.0.1") -> dict:
-        return {
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-            "X-UserType": "USER",
-            "X-SourceID": "WEB",
-            "X-ClientLocalIP": "127.0.0.1",
-            "X-ClientPublicIP": public_ip,
-            "X-MACAddress": "00:00:00:00:00:00",
-            "X-PrivateKey": api_key,
-        }
-
-    def _public_ip(self) -> str:
-        try:
-            return requests.get("https://api.ipify.org", timeout=3).text.strip() or "127.0.0.1"
-        except Exception:
-            return "127.0.0.1"
-
-    def _set_session(self, api_key: str, client_code: str, data: dict) -> None:
-        jwt = data.get("jwtToken")
-        refresh = data.get("refreshToken")
-        feed = data.get("feedToken")
-        if not jwt or not refresh or not feed:
-            raise RuntimeError("Angel One login succeeded without all required session tokens.")
-        self.api_key = api_key
-        self.client_code = client_code
-        self.refresh_token = refresh
-        self.feed_token = feed
-        self.login_at = time.time()
-        self.api = SmartConnect(
-            api_key=api_key,
-            access_token=jwt,
-            refresh_token=refresh,
-            feed_token=feed,
-            userId=client_code,
-        )
-
-    def login(self, api_key=None, client_code=None, pin=None, totp=None):
-        api_key = (api_key or self.api_key or C.API_KEY or "").strip()
-        client_code = (client_code or self.client_code or C.CLIENT or "").strip()
-        pin = (pin or self.pin or C.PIN or "").strip()
-        totp = (totp or "").strip()
-        if not totp and self.totp_secret:
-            totp = pyotp.TOTP(self.totp_secret).now()
-        if not api_key or not client_code or not pin or not totp:
-            raise RuntimeError("Angel One API key, Client ID, PIN/MPIN and current TOTP are required.")
-        if len(totp) != 6 or not totp.isdigit():
-            raise RuntimeError("TOTP must be the current 6-digit code.")
-
-        public_ip = self._public_ip()
-        body = {"clientcode": client_code, "password": pin, "totp": totp}
-        try:
-            response = requests.post(
-                LOGIN_URL,
-                headers=self._headers(api_key, public_ip),
-                json=body,
-                timeout=12,
-            )
-        except requests.RequestException as exc:
-            self.last_error = "Angel login network error: " + str(exc)
-            raise RuntimeError(self.last_error)
-
-        try:
-            result = response.json()
-        except ValueError:
-            result = {}
-        if response.status_code != 200 or not result.get("status"):
-            message = result.get("message") or result.get("errorcode") or "Angel One login rejected"
-            detail = f"{message} (HTTP {response.status_code})"
-            self.last_error = detail
-            self.api = None
-            raise RuntimeError(detail)
-
-        self._set_session(api_key, client_code, result["data"])
-
-        # Authentication success must not depend on the instrument-master download.
-        # If profile/master is temporarily unavailable, the session remains usable.
-        try:
+        self.api=None; self.chain={}; self.strikes=[]; self.expiry=None; self.chain_symbol=C.SYMBOL; self.chain_exchange="NFO"
+        self.last_chain_cache={}; self.last_chain_cache_ts={}
+        self.ws=None; self.ws_thread=None; self.ws_quotes={}; self.ws_lock=threading.Lock(); self.login_lock=threading.Lock(); self.session_started=0.0; self.session_ttl=6*60*60
+        self.active_api_key=None; self.active_client_code=None; self.active_pin=None; self.active_totp=None; self.last_snapshot=None
+    def login(self, api_key=None, client_code=None, pin=None, totp=None, force=False):
+        # Reuse one successful Angel session for 6 hours; avoid repeated TOTP/session calls.
+        now=time.time()
+        if not force and self.api is not None and now-self.session_started < self.session_ttl:
+            return {"status": True, "message": "Existing Angel session reused.", "data": {"session_reused": True}}
+        with self.login_lock:
+            now=time.time()
+            if not force and self.api is not None and now-self.session_started < self.session_ttl:
+                return {"status": True, "message": "Existing Angel session reused.", "data": {"session_reused": True}}
+            api_key=api_key or C.API_KEY; client_code=client_code or C.CLIENT; pin=pin or C.PIN
+            totp=totp or (pyotp.TOTP(C.TOTP_SECRET).now() if C.TOTP_SECRET else None)
+            if not api_key or not client_code or not pin or not totp:
+                raise RuntimeError("Angel credentials are not configured.")
+            self.api=SmartConnect(api_key=api_key)
+            self.active_api_key=api_key
+            self.active_client_code=client_code
+            self.active_pin=pin
+            self.active_totp=totp
+            d=self.api.generateSession(client_code,pin,totp)
+            if not d.get("status"):
+                self.api=None; self.session_started=0.0
+                raise RuntimeError(f"Angel login failed: {d.get('message', d)}")
+            try:
+                profile = self.api.getProfile(d.get("data", {}).get("refreshToken") or d.get("data", {}).get("refresh_token"))
+                if isinstance(profile, dict) and profile.get("status") is False:
+                    raise RuntimeError(
+                        f"SmartAPI data authentication rejected: {profile.get('errorcode','UNKNOWN')} {profile.get('message','')}"
+                    )
+            except Exception as ex:
+                self.api=None; self.session_started=0.0
+                raise RuntimeError(f"SmartAPI API key/data authentication rejected: {str(ex)[:220]}")
+            self.session_started=time.time()
             self.build_chain()
-        except Exception as exc:
-            self.last_error = "Login OK; instrument master unavailable: " + str(exc)
-        else:
-            self.last_error = None
-
-        self.start_live()
-        return result
-
-    def refresh_session(self):
-        if not self.api or not self.refresh_token:
-            return self.login()
-        public_ip = self._public_ip()
-        headers = self._headers(self.api_key, public_ip)
-        headers["Authorization"] = "Bearer " + self.api.access_token
-        try:
-            r = requests.post(
-                TOKEN_URL,
-                headers=headers,
-                json={"refreshToken": self.refresh_token},
-                timeout=12,
-            )
-            data = r.json()
-        except Exception as exc:
-            raise RuntimeError("Angel token refresh failed: " + str(exc))
-        if r.status_code != 200 or not data.get("status"):
-            raise RuntimeError(data.get("message") or data.get("errorcode") or "Angel token refresh rejected")
-        self._set_session(self.api_key, self.client_code, data["data"])
-        self.start_live()
-        return data
-
-    def ensure_session(self):
-        if self.api is None:
-            return self.login()
-        # SmartAPI documentation states the authenticated session is active until
-        # midnight; refresh proactively after several hours during a long process.
-        if self.login_at and time.time() - self.login_at > 3.5 * 3600:
-            try:
-                return self.refresh_session()
-            except Exception:
-                return self.login()
-        return {"status": True, "data": {"feedToken": self.feed_token}}
-
-    # ---------- live WebSocket 2.0 ----------
-
-    def _live_tokens(self):
-        wanted = []
-        for name in ("NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY"):
-            ex, token = INDEX[name]
-            wanted.append({"exchangeType": EXCHANGE_TYPE[ex], "tokens": [token]})
-        # Add the currently selected option strikes after the master is loaded.
-        option_tokens = [x["token"] for x in self.chain.values()]
-        if option_tokens:
-            wanted.append({"exchangeType": EXCHANGE_TYPE["NFO"], "tokens": option_tokens[:900]})
-        return wanted
-
-    def _on_live_open(self, wsapp):
-        self.live_connected = True
-        self.live_error = None
-        tokens = self._live_tokens()
-        try:
-            # LTP for indices; SNAP_QUOTE for options so OI is available.
-            index_groups = [x for x in tokens if x["exchangeType"] in (1, 3)]
-            option_groups = [x for x in tokens if x["exchangeType"] in (2, 4, 5)]
-            if index_groups:
-                self._ws.subscribe("vandana2idx", 1, index_groups)
-            for group in option_groups:
-                for start in range(0, len(group["tokens"]), 50):
-                    self._ws.subscribe(
-                        "vandana2opt",
-                        3,
-                        [{"exchangeType": group["exchangeType"], "tokens": group["tokens"][start:start + 50]}],
-                    )
-        except Exception as exc:
-            self.live_error = "Subscription failed: " + str(exc)
-
-    def _on_live_data(self, wsapp, message):
-        try:
-            token = str(message.get("token"))
-            mode = int(message.get("subscription_mode", 0))
-            raw_ltp = message.get("last_traded_price")
-            tick = {
-                "token": token,
-                "exchangeType": message.get("exchange_type"),
-                "mode": mode,
-                "ltp": (float(raw_ltp) / 100.0) if raw_ltp is not None else None,
-                "timestamp": message.get("exchange_timestamp"),
-            }
-            if mode == 3:
-                if message.get("open_interest") is not None:
-                    tick["oi"] = int(message["open_interest"])
-                if message.get("open_interest_change_percentage") is not None:
-                    tick["oiChangePct"] = float(message["open_interest_change_percentage"]) / 100.0
-            self.live_ticks[token] = tick
-            self.live_last_tick = time.time()
-        except Exception as exc:
-            self.live_error = "Tick parse failed: " + str(exc)
-
-    def _on_live_error(self, wsapp, error):
-        self.live_connected = False
-        self.live_error = str(error)
-
-    def _on_live_close(self, wsapp):
-        self.live_connected = False
-
-    def _live_loop(self):
-        while not self._ws_stop.is_set():
-            if self.api is None or not self.feed_token:
-                break
-            try:
-                with self._ws_lock:
-                    self._ws = SmartWebSocketV2(
-                        self.api.access_token,
-                        self.api_key,
-                        self.client_code,
-                        self.feed_token,
-                        max_retry_attempt=2,
-                        retry_strategy=1,
-                        retry_delay=5,
-                        retry_multiplier=2,
-                        retry_duration=30,
-                    )
-                    self._ws.on_open = self._on_live_open
-                    self._ws.on_data = self._on_live_data
-                    self._ws.on_error = self._on_live_error
-                    self._ws.on_close = self._on_live_close
-                    self._ws.connect()
-            except Exception as exc:
-                self.live_connected = False
-                self.live_error = str(exc)
-            finally:
-                with self._ws_lock:
-                    self._ws = None
-            if not self._ws_stop.is_set():
-                time.sleep(5)
-
-    def start_live(self):
-        if self.api is None or not self.feed_token:
-            return
-        with self._ws_lock:
-            if self._ws_thread and self._ws_thread.is_alive():
-                return
-            self._ws_stop.clear()
-            self._ws_thread = threading.Thread(target=self._live_loop, daemon=True, name="angel-websocket-v2")
-            self._ws_thread.start()
-
-    def stop_live(self):
-        self._ws_stop.set()
-        with self._ws_lock:
-            try:
-                if self._ws:
-                    self._ws.close_connection()
-            except Exception:
-                pass
-            self._ws = None
-        self.live_connected = False
-
-    # ---------- instrument master ----------
+            self._start_stream(d)
+            return d
 
     def _master(self):
-        fresh = os.path.exists(CACHE) and time.time() - os.path.getmtime(CACHE) < 43200
-        if not fresh:
-            urllib.request.urlretrieve(MASTER_URL, CACHE)
-        with open(CACHE, encoding="utf-8") as f:
-            return json.load(f)
+        fresh=os.path.exists(CACHE) and time.time()-os.path.getmtime(CACHE)<43200
+        if not fresh: urllib.request.urlretrieve(MASTER_URL,CACHE)
+        with open(CACHE) as f: return json.load(f)
+    def _symbol_config(self, symbol):
+        s=(symbol or C.SYMBOL).upper().replace(" ","")
+        aliases={"NIFTY50":"NIFTY","NIFTY":"NIFTY","BANKNIFTY":"BANKNIFTY","FINNIFTY":"FINNIFTY",
+                 "MIDCPNIFTY":"MIDCPNIFTY","MIDCAPSELECT":"MIDCPNIFTY","SENSEX":"SENSEX","BANKEX":"BANKEX"}
+        s=aliases.get(s,s)
+        if s in ("SENSEX","BANKEX"): return s,"BFO"
+        return s,"NFO"
 
-    def build_chain(self):
-        today = dt.date.today()
-        rows = [
-            r for r in self._master()
-            if r.get("name") == C.SYMBOL
-            and r.get("exch_seg") == "NFO"
-            and r.get("instrumenttype") == "OPTIDX"
-        ]
-        def exp(r):
-            return dt.datetime.strptime(r["expiry"], "%d%b%Y").date()
-        expiries = sorted({exp(r) for r in rows if exp(r) >= today})
-        if not expiries:
-            raise RuntimeError(f"No active {C.SYMBOL} option expiry found.")
-        self.expiry = expiries[0]
-        self.chain = {}
+    def build_chain(self, symbol=None):
+        symbol, exchange=self._symbol_config(symbol)
+        today=dt.date.today()
+        master=self._master()
+        rows=[r for r in master if str(r.get("name","")).upper()==symbol and r.get("exch_seg")==exchange and r.get("instrumenttype")=="OPTIDX"]
+        if not rows and symbol=="MIDCPNIFTY":
+            rows=[r for r in master if str(r.get("name","")).upper() in ("MIDCPNIFTY","MIDCPNIFTY") and r.get("exch_seg")==exchange and r.get("instrumenttype")=="OPTIDX"]
+        def exp(r): return dt.datetime.strptime(r["expiry"],"%d%b%Y").date()
+        expiries=sorted({exp(r) for r in rows if r.get("expiry") and exp(r)>=today})
+        if not expiries: raise RuntimeError(f"No active {symbol} option expiry found in {exchange}.")
+        self.expiry=expiries[0]; self.chain={}; self.chain_symbol=symbol; self.chain_exchange=exchange
         for r in rows:
-            if exp(r) != self.expiry:
-                continue
-            strike = float(r["strike"]) / 100
-            typ = r["symbol"][-2:]
-            if typ in ("CE", "PE"):
-                self.chain[(strike, typ)] = {"token": str(r["token"]), "symbol": r["symbol"]}
-        self.strikes = sorted({k[0] for k in self.chain})
-        if self.api is not None:
-            self.start_live()
+            if exp(r)!=self.expiry: continue
+            strike=float(r["strike"])/100; typ=str(r["symbol"])[-2:]
+            if typ in ("CE","PE"): self.chain[(strike,typ)]={"token":r["token"],"symbol":r["symbol"]}
+        self.strikes=sorted({k[0] for k in self.chain})
 
-    # ---------- REST market data ----------
+    def _index_token(self, symbol):
+        symbol,_=self._symbol_config(symbol)
+        if symbol in INDEX: return INDEX[symbol]
+        master=self._master()
+        aliases={"MIDCPNIFTY":["MIDCPNIFTY","MIDCAP SELECT","NIFTY MID SELECT"],"BANKEX":["BANKEX"]}
+        wanted=[symbol]+aliases.get(symbol,[])
+        for r in master:
+            if r.get("exch_seg") not in ("NSE","BSE") or r.get("instrumenttype")!="AMXIDX": continue
+            name=str(r.get("name","")).upper(); sym=str(r.get("symbol","")).upper()
+            if any(w.upper() in name or w.upper() in sym for w in wanted):
+                return str(r.get("token"))
+        raise RuntimeError(f"Index token not found for {symbol}.")
+
+    def spot(self, symbol=None):
+        symbol,_=self._symbol_config(symbol)
+        token=self._index_token(symbol)
+        with self.ws_lock:
+            tick=self.ws_quotes.get(str(token))
+        if tick and tick.get("ltp") is not None and time.time()-tick.get("ts",0) < 15:
+            return float(tick["ltp"])
+        exchange="BSE" if symbol in ("SENSEX","BANKEX") else "NSE"
+        r=self.api.getMarketData("LTP",{exchange:[token]})
+        return float(r["data"]["fetched"][0]["ltp"])
+
+    def _start_stream(self, session):
+        data=session.get("data",{}) if isinstance(session,dict) else {}
+        jwt=data.get("jwtToken") or data.get("jwt_token")
+        feed=data.get("feedToken") or data.get("feed_token")
+        api_key=self.active_api_key or C.API_KEY
+        client_code=self.active_client_code or C.CLIENT
+        if not jwt or not feed or not api_key or not client_code:
+            return
+        try:
+            if self.ws:
+                self.ws.close_connection()
+            self.ws=SmartWebSocketV2(jwt,api_key,client_code,feed,max_retry_attempt=5,retry_strategy=1,retry_delay=3,retry_multiplier=2,retry_duration=5)
+            self.ws.on_open=self._ws_on_open
+            self.ws.on_data=self._ws_on_data
+            self.ws.on_error=self._ws_on_error
+            self.ws.on_close=self._ws_on_close
+            self.ws_thread=threading.Thread(target=self.ws.connect,daemon=True,name="angel-smart-ws")
+            self.ws_thread.start()
+        except Exception:
+            self.ws=None
+
+    def _ws_tokens(self):
+        out=[]
+        if self.chain and self.strikes:
+            try:
+                spot=self.spot(self.chain_symbol)
+                atm=min(self.strikes,key=lambda x:abs(x-spot))
+                i=self.strikes.index(atm)
+                selected=self.strikes[max(0,i-10):i+11]
+                for strike in selected:
+                    for typ in ("CE","PE"):
+                        item=self.chain.get((strike,typ))
+                        if item and item.get("token"):
+                            out.append(str(item["token"]))
+            except Exception:
+                pass
+        try:
+            out.append(str(self._index_token(self.chain_symbol)))
+        except Exception:
+            pass
+        return list(dict.fromkeys(out))[:50]
+
+    def _ws_on_open(self, wsapp):
+        tokens=self._ws_tokens()
+        if not tokens:
+            return
+        exchange_type=4 if self.chain_exchange=="BFO" else 2
+        index_token=str(self._index_token(self.chain_symbol))
+        option_tokens=[t for t in tokens if t!=index_token]
+        groups=[]
+        if option_tokens:
+            groups.append({"exchangeType":exchange_type,"tokens":option_tokens})
+        groups.append({"exchangeType":1 if self.chain_exchange=="NFO" else 3,"tokens":[index_token]})
+        self.ws.subscribe("VNDWS001",SmartWebSocketV2.SNAP_QUOTE,groups)
+
+    def _ws_on_data(self, wsapp, message):
+        if not isinstance(message,dict):
+            return
+        token=str(message.get("token",""))
+        ltp=message.get("last_traded_price")
+        if ltp is None:
+            return
+        row={"ltp":float(ltp)/100.0,"ts":time.time()}
+        for src,dst in (("open_interest","oi"),("volume_trade_for_the_day","volume"),("open_price_of_the_day","open"),("high_price_of_the_day","high"),("low_price_of_the_day","low"),("closed_price","close"),("open_interest_change_percentage","oiChangePct")):
+            if message.get(src) is not None:
+                row[dst]=float(message[src])
+        if row.get("close") is not None:
+            row["chg"] = row["ltp"] - row["close"]
+        with self.ws_lock:
+            self.ws_quotes[token]=row
+        # Mirror the tick into the shared market core without touching signal formulas.
+        try:
+            item=next(((k[0],k[1]) for k,v in self.chain.items() if str(v.get("token"))==token), None)
+            if item:
+                strike,side=item
+                from market_core import bind_angel_tick
+                bind_angel_tick(self.chain_symbol,strike,side,ts=row["ts"],
+                                ltp=row.get("ltp"),oi=row.get("oi"),volume=row.get("volume"),
+                                open=row.get("open"),high=row.get("high"),low=row.get("low"),
+                                close=row.get("close"),chg=row.get("chg"),oiChangePct=row.get("oiChangePct"),
+                                token=token)
+        except Exception:
+            pass
+
+    def _ws_on_error(self, wsapp, error):
+        return
+
+    def _ws_on_close(self, wsapp):
+        return
 
     def require_api(self):
         if self.api is None:
             raise RuntimeError("Angel One session is not connected.")
         return self.api
 
-    def _rest_with_retry(self, fn):
-        self.ensure_session()
-        try:
-            return fn(self.api)
-        except Exception as first:
-            try:
-                self.refresh_session()
-                return fn(self.api)
-            except Exception:
-                raise first
+    def index_catalog(self):
+        master=self._master()
+        rows=[]; seen=set()
+        for r in master:
+            if r.get("instrumenttype")=="AMXIDX" and r.get("exch_seg") in ("NSE","BSE"):
+                token=str(r.get("token",""))
+                if not token or token in seen: continue
+                seen.add(token)
+                rows.append({"token":token,"name":r.get("name") or r.get("symbol"),"symbol":r.get("symbol"),"exchange":r.get("exch_seg")})
+        fixed=[
+            {"token":"99926000","name":"NIFTY 50","symbol":"Nifty 50","exchange":"NSE"},
+            {"token":"99926009","name":"NIFTY BANK","symbol":"Nifty Bank","exchange":"NSE"},
+            {"token":"99926037","name":"NIFTY FIN SERVICE","symbol":"Nifty Fin Service","exchange":"NSE"},
+            {"token":"99919000","name":"SENSEX","symbol":"SENSEX","exchange":"BSE"}]
+        bytoken={r["token"]:r for r in rows}
+        for r in fixed: bytoken[r["token"]]=r
+        return sorted(bytoken.values(),key=lambda x:(x["exchange"],x["name"] or ""))
 
-    def spot(self):
-        def call(api):
-            r = api.getMarketData("LTP", {"NSE": [INDEX[C.SYMBOL][1]]})
-            return float(r["data"]["fetched"][0]["ltp"])
-        return self._rest_with_retry(call)
+    def index_catalog_quotes(self):
+        api=self.require_api(); instruments=self.index_catalog(); grouped={"NSE":[],"BSE":[]}
+        for r in instruments: grouped[r["exchange"]].append(r["token"])
+        fetched=[]
+        for exchange,tokens in grouped.items():
+            for i in range(0,len(tokens),40):
+                batch=tokens[i:i+40]
+                if batch:
+                    result=api.getMarketData("FULL",{exchange:batch})
+                    fetched.extend(result.get("data",{}).get("fetched",[]) or [])
+        q={str(r.get("symbolToken")):r for r in fetched}
+        return {"data":[{**inst,"ltp":q.get(inst["token"],{}).get("ltp"),"open":q.get(inst["token"],{}).get("open"),"high":q.get(inst["token"],{}).get("high"),"low":q.get(inst["token"],{}).get("low"),"close":q.get(inst["token"],{}).get("close"),"netChange":q.get(inst["token"],{}).get("netChange"),"percentChange":q.get(inst["token"],{}).get("percentChange"),"volume":q.get(inst["token"],{}).get("tradeVolume")} for inst in instruments]}
 
     def index_quote(self, symbols=None):
-        master = self._master()
-        aliases = {
-            "NIFTY": ["NIFTY", "NIFTY 50"],
-            "BANKNIFTY": ["BANKNIFTY", "NIFTY BANK"],
-            "FINNIFTY": ["FINNIFTY", "NIFTY FIN SERVICE"],
-            "MIDCPNIFTY": ["MIDCPNIFTY", "NIFTY MIDCAP SELECT", "MIDCAP SELECT"],
-            "SENSEX": ["SENSEX", "BSE SENSEX"],
-            "BANKEX": ["BANKEX", "BSE BANKEX"],
+        api=self.require_api()
+        symbols=symbols or {
+            "NIFTY":"99926000","BANKNIFTY":"99926009","FINNIFTY":"99926037",
+            "SENSEX":"99919000"
         }
-        selected = []
-        for wanted_name, names in aliases.items():
-            rows = [
-                r for r in master
-                if str(r.get("name", "")).upper() in {n.upper() for n in names}
-                and str(r.get("exch_seg", "")).upper() in ("NSE", "BSE")
-            ]
-            if rows:
-                rows.sort(key=lambda x: (0 if str(x.get("name", "")).upper() == wanted_name else 1, str(x.get("exch_seg", ""))))
-                selected.append(rows[0])
-        if not selected:
-            raise RuntimeError("No supported index instruments found in Angel instrument master.")
-        by_exchange = {}
-        for r in selected:
-            by_exchange.setdefault(str(r["exch_seg"]), []).append(str(r["token"]))
-        result = self._rest_with_retry(lambda api: api.getMarketData("FULL", by_exchange))
-        fetched = (result.get("data") or {}).get("fetched") or []
-        meta = {str(r["token"]): r for r in selected}
-        for q in fetched:
-            m = meta.get(str(q.get("symbolToken")))
-            if m:
-                q["exchange"] = m.get("exch_seg")
-                q["tradingSymbol"] = m.get("symbol") or m.get("name")
-                q["indexName"] = m.get("name")
+        tokens=list(symbols.values())
+        result=api.getMarketData("FULL", {"NSE": [t for t in tokens if t!="99919000"], "BSE":["99919000"]})
         return result
 
     def candles(self, exchange, token, interval="FIVE_MINUTE", days=1):
-        now = dt.datetime.now(dt.timezone(dt.timedelta(hours=5, minutes=30)))
-        start = now - dt.timedelta(days=max(1, min(int(days), 30)))
-        api_interval = "ONE_MINUTE" if interval == "TWO_MINUTE" else interval
-        p = {"exchange": exchange, "symboltoken": str(token), "interval": api_interval,
-             "fromdate": start.strftime("%Y-%m-%d %H:%M"), "todate": now.strftime("%Y-%m-%d %H:%M")}
-        result = self._rest_with_retry(lambda api: api.getCandleData(p))
-        if interval != "TWO_MINUTE":
-            return result
-        bucket = {}
-        for row in result.get("data") or []:
-            if not isinstance(row, list) or len(row) < 6:
-                continue
-            try:
-                t = dt.datetime.fromisoformat(str(row[0]))
-                key = t.replace(minute=(t.minute // 2) * 2, second=0, microsecond=0).isoformat()
-            except Exception:
-                key = str(row[0])[:16]
-            if key not in bucket:
-                bucket[key] = [key, row[1], row[2], row[3], row[4], row[5]]
-            else:
-                b = bucket[key]
-                b[2] = max(b[2], row[2])
-                b[3] = min(b[3], row[3])
-                b[4] = row[4]
-                b[5] = (b[5] or 0) + (row[5] or 0)
-        return {"status": True, "message": "SUCCESS", "data": [bucket[k] for k in sorted(bucket)]}
+        api=self.require_api()
+        now=dt.datetime.now(dt.timezone(dt.timedelta(hours=5,minutes=30)))
+        start=now-dt.timedelta(days=max(1,min(int(days),30)))
+        p={"exchange":exchange,"symboltoken":str(token),"interval":interval,
+           "fromdate":start.strftime("%Y-%m-%d %H:%M"),"todate":now.strftime("%Y-%m-%d %H:%M")}
+        return api.getCandleData(p)
 
     def oi_history(self, token, interval="THREE_MINUTE", hours=6):
-        now = dt.datetime.now(dt.timezone(dt.timedelta(hours=5, minutes=30)))
-        start = now - dt.timedelta(hours=max(1, min(int(hours), 24)))
-        p = {"exchange": "NFO", "symboltoken": str(token), "interval": interval,
-             "fromdate": start.strftime("%Y-%m-%d %H:%M"), "todate": now.strftime("%Y-%m-%d %H:%M")}
-        return self._rest_with_retry(lambda api: api.getOIData(p))
+        api=self.require_api()
+        now=dt.datetime.now(dt.timezone(dt.timedelta(hours=5,minutes=30)))
+        start=now-dt.timedelta(hours=max(1,min(int(hours),24)))
+        p={"exchange":"NFO","symboltoken":str(token),"interval":interval,
+           "fromdate":start.strftime("%Y-%m-%d %H:%M"),"todate":now.strftime("%Y-%m-%d %H:%M")}
+        return api.getOIData(p)
 
     def option_greeks(self, name, expiry):
-        return self._rest_with_retry(lambda api: api._postRequest("api.optionGreek", {"name": name, "expirydate": expiry}))
+        api=self.require_api()
+        return api._postRequest("api.optionGreek", {"name":name,"expirydate":expiry})
 
     def gainers_losers(self, datatype="PercPriceGainers", expirytype="NEAR"):
-        return self._rest_with_retry(lambda api: api._postRequest("api.gainersLosers", {"datatype": datatype, "expirytype": expirytype}))
+        api=self.require_api()
+        return api._postRequest("api.gainersLosers", {"datatype":datatype,"expirytype":expirytype})
 
     def oi_buildup(self, datatype="Long Built Up", expirytype="NEAR"):
-        return self._rest_with_retry(lambda api: api._postRequest("api.oIBuildup", {"datatype": datatype, "expirytype": expirytype}))
+        api=self.require_api()
+        return api._postRequest("api.oIBuildup", {"datatype":datatype,"expirytype":expirytype})
 
     def put_call_ratio(self, expirytype="NEAR"):
-        return self._rest_with_retry(lambda api: api._postRequest("api.putCallRatio", {"expirytype": expirytype}))
+        api=self.require_api()
+        return api._postRequest("api.putCallRatio", {"expirytype":expirytype})
 
     def search(self, exchange, query):
-        return self._rest_with_retry(lambda api: api.searchScrip(exchange, query))
+        return self.require_api().searchScrip(exchange, query)
 
     def portfolio(self):
-        api = self.require_api()
-        # Read-only endpoints only; no order placement/cancellation is exposed.
-        return {"holdings": api.holding(), "positions": api.position(), "orders": api.orderBook(), "trades": api.tradeBook()}
+        api=self.require_api()
+        return {
+            "holdings": api.holding(),
+            "positions": api.position(),
+            "orders": api.orderBook(),
+            "trades": api.tradeBook()
+        }
+
 
     def commodity_quotes(self):
-        master = self._master()
-        wanted = ("CRUDEOIL", "NATURALGAS", "GOLD", "SILVER", "COPPER", "ALUMINIUM", "ZINC", "LEAD")
-        today = dt.date.today()
-        selected = []
+        api=self.require_api()
+        master=self._master()
+        wanted=("CRUDEOIL","CRUDEOILM","NATURALGAS","NATGASMINI","GOLD","GOLDM","SILVER","SILVERM","COPPER","ALUMINIUM","ZINC","LEAD","NICKEL","MENTHAOIL","COTTON")
+        today=dt.date.today()
+        selected=[]
         for name in wanted:
-            candidates = []
+            candidates=[]
             for r in master:
-                if r.get("exch_seg") != "MCX" or not r.get("name", "").upper().startswith(name):
-                    continue
-                exp = r.get("expiry", "")
+                if r.get("exch_seg")!="MCX" or not r.get("name","").upper().startswith(name): continue
+                exp=r.get("expiry","")
                 if exp:
                     try:
-                        ed = dt.datetime.strptime(exp, "%d%b%Y").date()
-                        if ed >= today:
-                            candidates.append((ed, r))
+                        ed=dt.datetime.strptime(exp,"%d%b%Y").date()
+                        if ed>=today: candidates.append((ed,r))
                     except Exception:
                         pass
             if candidates:
-                candidates.sort(key=lambda x: x[0])
+                candidates.sort(key=lambda x:x[0])
                 selected.append(candidates[0][1])
-        tokens = [str(r["token"]) for r in selected]
-        if not tokens:
-            return {"data": {"fetched": [], "unfetched": []}, "instruments": selected}
-        result = self._rest_with_retry(lambda api: api.getMarketData("FULL", {"MCX": tokens}))
-        by = {str(r["symbolToken"]): r for r in result.get("data", {}).get("fetched", [])}
-        rows = []
+        tokens=[str(r["token"]) for r in selected]
+        if not tokens: return {"data":{"fetched":[],"unfetched":[]},"instruments":[]}
+        result=api.getMarketData("FULL",{"MCX":tokens})
+        by={str(r["symbolToken"]):r for r in result.get("data",{}).get("fetched",[])}
+        rows=[]
         for r in selected:
-            q = by.get(str(r["token"]))
+            q=by.get(str(r["token"]))
             if q:
-                rows.append({"name": r.get("name"), "tradingSymbol": r.get("symbol"), "token": str(r["token"]),
-                             "expiry": r.get("expiry"), "ltp": q.get("ltp"), "open": q.get("open"),
-                             "high": q.get("high"), "low": q.get("low"), "close": q.get("close"),
-                             "volume": q.get("tradeVolume"), "oi": q.get("opnInterest")})
-        return {"data": {"fetched": rows, "unfetched": []}, "instruments": selected}
+                rows.append({"name":r.get("name"),"tradingSymbol":r.get("symbol"),"token":str(r["token"]),
+                             "expiry":r.get("expiry"),"ltp":q.get("ltp"),"open":q.get("open"),
+                             "high":q.get("high"),"low":q.get("low"),"close":q.get("close"),
+                             "volume":q.get("tradeVolume"),"oi":q.get("opnInterest")})
+        return {"data":{"fetched":rows,"unfetched":[]},"instruments":selected}
+
+    def _market_data_full_retry(self, exchange, tokens):
+        last=None
+        for attempt in range(2):
+            try:
+                result=self.api.getMarketData("FULL",{exchange:tokens})
+                if isinstance(result,dict) and result.get("status") is False:
+                    raise RuntimeError(str(result.get("message") or "Angel market-data request failed"))
+                return result
+            except Exception as e:
+                last=e
+                if attempt==0:
+                    try:
+                        self.api=None
+                        self.login(api_key=self.active_api_key, client_code=self.active_client_code, pin=self.active_pin, totp=self.active_totp, force=True)
+                    except Exception as relogin_error:
+                        last=relogin_error
+                        break
+        raise RuntimeError(str(last))
 
     def option_chain_rows(self, symbol=None, around=None, count=10):
         self.require_api()
-        symbol = (symbol or C.SYMBOL).upper()
-        exchange = "BFO" if symbol in ("SENSEX", "BANKEX") else "NFO"
-        master = self._master()
-        aliases = {
-            "NIFTY": {"NIFTY", "NIFTY 50"},
-            "BANKNIFTY": {"BANKNIFTY", "NIFTY BANK"},
-            "FINNIFTY": {"FINNIFTY", "NIFTY FIN SERVICE"},
-            "MIDCPNIFTY": {"MIDCPNIFTY", "NIFTY MIDCAP SELECT", "MIDCAP SELECT"},
-            "SENSEX": {"SENSEX", "BSE SENSEX"},
-            "BANKEX": {"BANKEX", "BSE BANKEX"},
-        }
-        names = aliases.get(symbol, {symbol})
-        rows = [r for r in master if str(r.get("name", "")).upper() in {n.upper() for n in names}
-                and str(r.get("exch_seg", "")).upper() == exchange and r.get("instrumenttype") == "OPTIDX"]
-        def exp(r): return dt.datetime.strptime(r["expiry"], "%d%b%Y").date()
-        today = dt.date.today()
-        expiries = sorted({exp(r) for r in rows if r.get("expiry") and exp(r) >= today})
-        if not expiries:
-            raise RuntimeError(f"No active {symbol} option expiry found.")
-        expiry = expiries[0]
-        chain = {}
-        for r in rows:
-            if exp(r) != expiry:
-                continue
-            try:
-                strike = float(r["strike"]) / 100
-            except Exception:
-                continue
-            typ = str(r.get("symbol", ""))[-2:]
-            if typ in ("CE", "PE"):
-                chain[(strike, typ)] = {"token": str(r["token"]), "symbol": r["symbol"]}
-        strikes = sorted({k[0] for k in chain})
-        index_rows = [r for r in master if str(r.get("name", "")).upper() in {n.upper() for n in names}
-                      and str(r.get("exch_seg", "")).upper() in ("NSE", "BSE")]
-        if not index_rows:
-            raise RuntimeError(f"No live index token found for {symbol}.")
-        idx = index_rows[0]
-        q = self._rest_with_retry(lambda api: api.getMarketData("LTP", {str(idx["exch_seg"]): [str(idx["token"])]}))
-        fetched = (q.get("data") or {}).get("fetched") or []
-        if not fetched:
-            raise RuntimeError(f"No spot quote returned for {symbol}.")
-        spot = float(fetched[0]["ltp"])
-        atm = around if around is not None else min(strikes, key=lambda s: abs(s - spot))
-        idx_atm = min(range(len(strikes)), key=lambda i: abs(strikes[i] - atm))
-        selected = strikes[max(0, idx_atm - int(count)):idx_atm + int(count) + 1]
-        token_map = {}
-        for s in selected:
-            for typ in ("CE", "PE"):
-                item = chain.get((s, typ))
-                if item:
-                    token_map[item["token"]] = (s, typ, item["symbol"])
-        rows_out = []
-        toks = list(token_map)
-        for j in range(0, len(toks), 50):
-            rr = self._rest_with_retry(lambda api, part=toks[j:j + 50]: api.getMarketData("FULL", {exchange: part}))
-            for q in rr.get("data", {}).get("fetched", []):
-                item = token_map.get(str(q.get("symbolToken")))
-                if not item:
+        requested,_=self._symbol_config(symbol)
+        cache_key=f"{requested}:{int(count)}"
+        cached=self.last_chain_cache.get(cache_key)
+        cached_at=self.last_chain_cache_ts.get(cache_key,0)
+        if cached and time.time()-cached_at < 4:
+            return {**cached,"cached":True,"cache_age_sec":round(time.time()-cached_at,1)}
+        try:
+            if not self.chain or self.chain_symbol!=requested:
+                self.build_chain(requested)
+            spot=self.spot(requested)
+            atm=around if around is not None else min(self.strikes,key=lambda s:abs(s-spot))
+            idx=min(range(len(self.strikes)),key=lambda i:abs(self.strikes[i]-atm))
+            count=max(10,min(int(count),250))
+            selected=self.strikes[max(0,idx-count):idx+count+1]
+            token_map={}
+            for strike in selected:
+                for typ in ("CE","PE"):
+                    item=self.chain.get((strike,typ))
+                    if item: token_map[item["token"]]=(strike,typ,item["symbol"])
+            rows=[]
+            toks=list(token_map)
+            with self.ws_lock:
+                ws_snapshot={k:v.copy() for k,v in self.ws_quotes.items() if time.time()-v.get("ts",0) < 15}
+            for token,item in token_map.items():
+                q=ws_snapshot.get(str(token))
+                if not q:
                     continue
-                s, typ, sym = item
-                row = {"strike": s, "type": typ, "symbol": sym, "token": str(q.get("symbolToken")),
-                       "ltp": q.get("ltp"), "open": q.get("open"), "high": q.get("high"),
-                       "low": q.get("low"), "close": q.get("close"), "oi": q.get("opnInterest"),
-                       "volume": q.get("tradeVolume"), "buyQty": q.get("totalBuyQuantity"),
-                       "sellQty": q.get("totalSellQuantity")}
-                try:
-                    cur = float(q.get("opnInterest", 0))
-                    prev = self.prev_oi.get(str(q.get("symbolToken")))
-                    row["oiChange"] = None if prev is None else cur - prev
-                    self.prev_oi[str(q.get("symbolToken"))] = cur
-                except Exception:
-                    pass
-                rows_out.append(row)
-        return {"symbol": symbol, "spot": spot, "atm": atm, "expiry": str(expiry), "rows": rows_out}
+                strike,typ,sym=item
+                rows.append({"strike":strike,"type":typ,"symbol":sym,"token":str(token),
+                             "ltp":q.get("ltp"),"open":q.get("open"),"high":q.get("high"),"low":q.get("low"),
+                             "close":q.get("close"),"oi":q.get("oi"),"volume":q.get("volume"),
+                             "oiChangePct":q.get("oiChangePct")})
+            if len(rows) < max(4,int(len(toks)*0.6)):
+                rows=[]
+                for j in range(0,len(toks),50):
+                    result=self._market_data_full_retry(self.chain_exchange,toks[j:j+50])
+                    for q in result.get("data",{}).get("fetched",[]) or []:
+                        item=token_map.get(str(q.get("symbolToken")))
+                        if not item: continue
+                        strike,typ,sym=item
+                        rows.append({"strike":strike,"type":typ,"symbol":sym,"token":str(q.get("symbolToken")),
+                                     "ltp":q.get("ltp"),"open":q.get("open"),"high":q.get("high"),"low":q.get("low"),
+                                     "close":q.get("close"),"oi":q.get("opnInterest"),"volume":q.get("tradeVolume"),
+                                     "buyQty":q.get("totalBuyQuantity"),"sellQty":q.get("totalSellQuantity"),
+                                     "netChange":q.get("netChange"),"priceChange":q.get("netChange")})
+            rows.sort(key=lambda r:(float(r["strike"]),0 if r["type"]=="CE" else 1))
+            result={"symbol":requested,"exchange":self.chain_exchange,"spot":spot,"atm":atm,"expiry":str(self.expiry),
+                    "rows":rows,"cached":False,"source":"Angel One SmartAPI"}
+            self.last_chain_cache[cache_key]=result
+            self.last_chain_cache_ts[cache_key]=time.time()
+            return result
+        except Exception as live_error:
+            cached=self.last_chain_cache.get(cache_key)
+            if cached:
+                age=int(time.time()-self.last_chain_cache_ts.get(cache_key,time.time()))
+                return {**cached,"cached":True,"cache_age_sec":max(0,age),"source":"Angel One SmartAPI cached last-good chain",
+                        "live_error":str(live_error)[:240]}
+            raise
 
     def snapshot(self):
-        self.ensure_session()
-        spot = self.spot()
-        if not self.strikes:
-            self.build_chain()
-        atm = min(self.strikes, key=lambda s: abs(s - spot))
-        i = self.strikes.index(atm)
-        sel = self.strikes[max(0, i - C.N):i + C.N + 1]
-        tok2key = {}
+        if self.api is None: raise RuntimeError("Angel session is not connected.")
+        spot=self.spot(); atm=min(self.strikes,key=lambda s:abs(s-spot)); i=self.strikes.index(atm)
+        sel=self.strikes[max(0,i-C.N):i+C.N+1]; tok2key={}
         for s in sel:
-            for typ in ("CE", "PE"):
-                if (s, typ) in self.chain:
-                    tok2key[self.chain[(s, typ)]["token"]] = (s, typ)
-        opts = {}
-        # Prefer the WebSocket cache; REST is only the snapshot fallback.
-        for token, key in tok2key.items():
-            tick = self.live_ticks.get(str(token))
-            if tick and tick.get("ltp") is not None:
-                opts[key] = {"ltp": tick["ltp"], "oi": float(tick.get("oi") or 0), "vol": 0}
-        missing = [t for t in tok2key if t not in self.live_ticks]
-        for j in range(0, len(missing), 50):
-            part = missing[j:j + 50]
-            r = self._rest_with_retry(lambda api, p=part: api.getMarketData("FULL", {"NFO": p}))
-            for q in r.get("data", {}).get("fetched", []):
-                key = tok2key.get(str(q.get("symbolToken")))
-                if key:
-                    opts[key] = {"ltp": float(q.get("ltp", 0)), "oi": float(q.get("opnInterest", 0)), "vol": float(q.get("tradeVolume", 0))}
-        return {"ts": time.time(), "spot": spot, "atm": atm, "opts": opts}
+            for t in ("CE","PE"):
+                if (s,t) in self.chain: tok2key[self.chain[(s,t)]["token"]]=(s,t)
+        opts={}; toks=list(tok2key)
+        with self.ws_lock:
+            ws_snapshot={k:v.copy() for k,v in self.ws_quotes.items() if time.time()-v.get("ts",0) < 15}
+        for token,k in tok2key.items():
+            q=ws_snapshot.get(str(token))
+            if q:
+                opts[k]={"ltp":float(q.get("ltp",0)),"oi":float(q.get("oi",0)),"vol":float(q.get("volume",0)),"symbol":self.chain[k].get("symbol"),"token":self.chain[k].get("token")}
+        if len(opts) < max(4,int(len(toks)*0.6)):
+            opts={}
+            for j in range(0,len(toks),50):
+                r=self._market_data_full_retry(self.chain_exchange,toks[j:j+50])
+                for q in r["data"]["fetched"]:
+                    k=tok2key.get(q["symbolToken"])
+                    if k: opts[k]={"ltp":float(q["ltp"]),"oi":float(q.get("opnInterest",0)),"vol":float(q.get("tradeVolume",0)),"symbol":self.chain[k].get("symbol"),"token":self.chain[k].get("token")}
+        previous = self.last_snapshot.get("opts", {}) if isinstance(self.last_snapshot, dict) else {}
+        for key, item in opts.items():
+            old = previous.get(key) if isinstance(previous, dict) else None
+            if isinstance(old, dict):
+                if item.get("ltp") is not None and old.get("ltp") is not None:
+                    item["ltp_change"] = float(item["ltp"]) - float(old["ltp"])
+                if item.get("oi") is not None and old.get("oi") is not None:
+                    item["oi_change"] = float(item["oi"]) - float(old["oi"])
+                if item.get("vol") is not None and old.get("vol") is not None:
+                    item["volume_change"] = float(item["vol"]) - float(old["vol"])
+        result = {"ts":time.time(),"symbol":self.chain_symbol or C.SYMBOL,"spot":spot,"atm":atm,"opts":opts,"expiry":str(self.expiry) if self.expiry else None}
+        self.last_snapshot = {"ts":result["ts"],"opts":{k:dict(v) for k,v in opts.items()}}
+        return result

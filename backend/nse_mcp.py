@@ -10,40 +10,117 @@ class NSEMCP:
     def __init__(self, url=NSE_MCP_URL):
         self.url = url
         self.timeout = 12
+        self.protocol_versions = ['2025-06-18', '2025-03-26', '2024-11-05']
 
-    def _post(self, payload, session_id=None):
+    def _post(self, payload, session_id=None, protocol_version=None):
         headers = {
             "Content-Type": "application/json",
             "Accept": "application/json, text/event-stream",
+            "User-Agent": "NSE-Algo-Signal/1.0",
+            "Origin": "https://www.nseindia.com",
+            "Referer": "https://www.nseindia.com/",
         }
         if session_id:
             headers["Mcp-Session-Id"] = session_id
+        if protocol_version:
+            headers["MCP-Protocol-Version"] = protocol_version
         r = requests.post(self.url, json=payload, headers=headers, timeout=self.timeout)
         r.raise_for_status()
         sid = r.headers.get("mcp-session-id") or session_id
         text = r.text.strip()
-        if text.startswith("data:"):
-            for line in text.splitlines():
-                if line.startswith("data:"):
+        # Streamable HTTP may return SSE frames with event:/data: prefixes.
+        for line in text.splitlines():
+            line = line.strip()
+            if line.startswith("data:"):
+                raw = line[5:].strip()
+                if raw:
                     try:
-                        return json.loads(line[5:].strip()), sid
+                        return json.loads(raw), sid
                     except Exception:
                         continue
-        return (r.json() if text else {}), sid
+        if text:
+            try:
+                return r.json(), sid
+            except Exception:
+                return {"raw": text[:12000]}, sid
+        return {}, sid
+
+    def _session(self):
+        last=None
+        for version in self.protocol_versions:
+            try:
+                init, sid = self._post({
+                    "jsonrpc":"2.0","id":1,"method":"initialize",
+                    "params":{
+                        "protocolVersion":version,
+                        "capabilities":{},
+                        "clientInfo":{"name":"NSE Algo Signal","version":"1.0"}
+                    }
+                }, protocol_version=version)
+                negotiated=((init.get("result") or {}).get("protocolVersion") or version)
+                self._post({"jsonrpc":"2.0","method":"notifications/initialized","params":{}}, sid, negotiated)
+                return sid, negotiated
+            except Exception as e:
+                last=e
+        raise RuntimeError("NSE MCP initialize failed: " + str(last))
 
     def tools(self):
-        init, sid = self._post({
-            "jsonrpc":"2.0","id":1,"method":"initialize",
-            "params":{
-                "protocolVersion":"2025-06-18",
-                "capabilities":{},
-                "clientInfo":{"name":"NSE Algo Signal","version":"1.0"}
-            }
-        })
-        self._post({"jsonrpc":"2.0","method":"notifications/initialized","params":{}}, sid)
-        result, sid = self._post({"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}, sid)
-        return result.get("result", {}).get("tools", [])
+        sid, version = self._session()
+        result, _ = self._post({"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}, sid, version)
+        tools=result.get("result", {}).get("tools", [])
+        if not tools:
+            raise RuntimeError("NSE MCP connected but returned no tools.")
+        return tools
 
+    def call_tool(self, tool_name, arguments=None):
+        sid, version = self._session()
+        result, _ = self._post({
+            "jsonrpc":"2.0","id":int(__import__("time").time()*1000) % 1000000000,
+            "method":"tools/call",
+            "params":{"name":tool_name,"arguments":arguments or {}}
+        }, sid, version)
+        return result
+
+    def _tool_arguments(self, tool, symbol):
+        props = (tool.get("inputSchema") or {}).get("properties", {})
+        required = (tool.get("inputSchema") or {}).get("required", []) or []
+        args = {}
+        for name in props:
+            key = str(name).lower()
+            if key in {"symbol","index","indexsymbol","symbolname","underlying","underlyingsymbol","name"}:
+                args[name] = symbol
+            elif key in {"exchange","exchange_code"}:
+                args[name] = "NSE"
+            elif key in {"segment","segment_code"}:
+                args[name] = "CM"
+        if any(req not in args and req in required for req in required):
+            return None
+        return args
+
+    def context(self, symbol="NIFTY"):
+        tools = self.tools()
+        data = []
+        errors = []
+        keywords = ("live", "index", "quote", "price", "breadth", "gainer", "loser", "fresh")
+        candidates = [t for t in tools if any(k in str(t.get("name","")).lower() for k in keywords)]
+        for tool in candidates[:4]:
+            args = self._tool_arguments(tool, symbol.upper())
+            if args is None:
+                continue
+            try:
+                result = self.call_tool(tool.get("name"), args)
+                data.append({"tool":tool.get("name"),"arguments":args,"result":result})
+            except Exception as e:
+                errors.append({"tool":tool.get("name"),"error":str(e)[:300]})
+        return {
+            "connected": True,
+            "endpoint": self.url,
+            "tool_count": len(tools),
+            "tools": [{"name":t.get("name"),"description":t.get("description")} for t in tools],
+            "data": data,
+            "tool_errors": errors,
+            "option_chain_tool_available": any("option" in str(t.get("name","")).lower() and "chain" in str(t.get("name","")).lower() for t in tools),
+        }
     def option_chain(self, symbol="NIFTY", expiry=None):
         tools = self.tools()
         candidates = [t for t in tools if "option" in t.get("name","").lower() and "chain" in t.get("name","").lower()]
@@ -55,18 +132,11 @@ class NSEMCP:
         if "symbol" in props: args["symbol"] = symbol
         elif "index" in props: args["index"] = symbol
         if expiry and "expiry" in props: args["expiry"] = expiry
-        _, sid = self._post({
-            "jsonrpc":"2.0","id":3,"method":"initialize",
-            "params":{
-                "protocolVersion":"2025-06-18","capabilities":{},
-                "clientInfo":{"name":"NSE Algo Signal","version":"1.0"}
-            }
-        })
-        self._post({"jsonrpc":"2.0","method":"notifications/initialized","params":{}}, sid)
+        sid, version = self._session()
         result, _ = self._post({
             "jsonrpc":"2.0","id":4,"method":"tools/call",
             "params":{"name":tool["name"],"arguments":args}
-        }, sid)
+        }, sid, version)
         return tool["name"], result
 
 def flatten(obj, prefix=""):
