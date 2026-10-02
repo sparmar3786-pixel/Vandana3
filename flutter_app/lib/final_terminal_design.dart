@@ -117,7 +117,7 @@ class _FinalTerminalDesignState extends State<FinalTerminalDesign>{
     while(base.endsWith('/')) base=base.substring(0,base.length-1);
     if(base.isEmpty){setState(()=>apiStatus='Enter backend URL first');return;}
     try{
-      final r=await http.post(Uri.parse(base+'/api/angel/connect')).timeout(const Duration(seconds:12));
+      final r=await http.get(Uri.parse(base+'/v1/angel/status'),headers:{'x-token':'change-me'}).timeout(const Duration(seconds:12));
       final j=jsonDecode(r.body) as Map<String,dynamic>;
       setState(()=>apiStatus=r.statusCode<300 && j['connected']==true?'Angel One connected':'Connection failed');
       if(r.statusCode<300) await _loadCandles();
@@ -129,7 +129,7 @@ class _FinalTerminalDesignState extends State<FinalTerminalDesign>{
     while(base.endsWith('/')) base=base.substring(0,base.length-1);
     if(base.isEmpty)return;
     try{
-      final url=base+'/api/candles/'+Uri.encodeComponent(_apiIndex(selectedIndex))+'?interval='+selectedTimeframe+'&days=5';
+      final url=base+'/v1/angel/candles/'+Uri.encodeComponent(_apiIndex(selectedIndex))+'?interval='+selectedTimeframe+'&days=5';
       final r=await http.get(Uri.parse(url)).timeout(const Duration(seconds:15));
       if(r.statusCode<300){
         final j=jsonDecode(r.body) as Map<String,dynamic>;
@@ -144,7 +144,7 @@ class _FinalTerminalDesignState extends State<FinalTerminalDesign>{
     while(base.endsWith('/')) base=base.substring(0,base.length-1);
     if(base.isEmpty){setState(()=>strategyResults=[]);return;}
     try{
-      final url=base+'/api/strategies?q='+Uri.encodeQueryComponent(q)+'&limit=100';
+      final url=base+'/v1/strategies?q='+Uri.encodeQueryComponent(q)+'&limit=100';
       final r=await http.get(Uri.parse(url)).timeout(const Duration(seconds:10));
       if(r.statusCode<300){
         final j=jsonDecode(r.body) as Map<String,dynamic>;
