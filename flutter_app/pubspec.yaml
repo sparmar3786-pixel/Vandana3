@@ -10,8 +10,11 @@ dependencies:
   http: ^1.2.0
   shared_preferences: ^2.2.0
   file_saver: ^0.3.1
+  flutter_svg: ^2.0.10+1
 flutter:
   uses-material-design: true
+  assets:
+    - assets/market_hero.svg
 
 dev_dependencies:
   flutter_test:
