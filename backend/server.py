@@ -331,6 +331,22 @@ def strategy_refresh(index:str="NIFTY",x_token:str=Header(None)):
     auth(x_token)
     return _strategy_refresh(index)
 
+@app.get("/v1/diagnostics")
+def diagnostics(x_token:str=Header(None)):
+    auth(x_token)
+    ev=getattr(eng,"strategy_evidence",[]) if hasattr(eng,"strategy_evidence") else []
+    return {
+        "angel":{"connected":client.api is not None,"message":state["angel_message"]},
+        "nse":{"available":state["nse_error"] is None,"error":state["nse_error"]},
+        "nse_mcp":{"connected":state["nse_mcp_error"] is None,"error":state["nse_mcp_error"]},
+        "strategies":{
+            "registered":len(ev),"evaluated":len(ev),
+            "active":sum(1 for x in ev if isinstance(x,dict) and x.get("state")=="active"),
+            "unavailable":sum(1 for x in ev if isinstance(x,dict) and x.get("state")=="unavailable"),
+            "not_evaluated":0
+        }
+    }
+
 @app.get("/v1/audit/latest")
 def latest_audit(x_token:str=Header(None)):
     auth(x_token); last=eng.last if isinstance(eng.last,dict) else {}; return {"action":last.get("action","WAIT"),"reasons":last.get("reasons",[]),"timestamp":state["last_update"]}
