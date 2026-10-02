@@ -1,4 +1,4 @@
-"""Turn NSE option-chain into AI features + a rule-based trend fallback."""
+"""Turn NSE option-chain into deterministic trading features."""
 import math
 
 FEATURES = ["pcr_oi", "pcr_chg", "chg_imb", "buildup", "dist_sup", "dist_res",
@@ -59,11 +59,3 @@ def compute(ch, prev=None, n=6):
     f["_support"], f["_resistance"], f["_maxpain"], f["_spot"] = sup, res, pain, spot
     return f
 
-
-def rule_p_up(f):
-    c = lambda x: max(-1.0, min(1.0, x))
-    s = (0.25 * c((f["pcr_oi"] - 1) / 0.4) + 0.2 * c(f["chg_imb"]) + 0.25 * c(f["buildup"] * 2)
-         + 0.1 * c(f["d_imb"]) + 0.1 * c(f["maxpain_dist"] * 200) + 0.1 * c(-f["iv_skew"] * 10))
-    if f["dist_sup"] < 0.003: s += 0.15
-    if f["dist_res"] < 0.003: s -= 0.15
-    return 0.5 + 0.4 * c(s)
