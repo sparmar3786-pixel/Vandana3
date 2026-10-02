@@ -1,9 +1,8 @@
-"""Angel One live OI-buildup engine (entry/SL/target) + NSE-trained AI trend filter."""
+"""Angel One live OI-buildup engine (entry/SL/target) + deterministic NSE trend filter."""
 import csv, os
 from collections import deque
 import numpy as np
 import config as C
-import ai_model
 
 NSE_LOG = "data/nse_features.csv"
 
@@ -34,9 +33,14 @@ class Engine:
         self.last = {"action": "WAIT", "reasons": ["Warming up... data collect ho raha hai"]}
 
     def set_nse(self, f, ts):
-        p, src = ai_model.p_up(f)
+        # Deterministic NSE trend score; no external AI/model is used.
+        raw = 0.45 * float(f.get("chg_imb", 0.0)) + 0.35 * float(f.get("buildup", 0.0))
+        pcr = float(f.get("pcr_oi", 1.0))
+        raw += 0.20 * max(-1.0, min(1.0, pcr - 1.0))
+        score = max(-1.0, min(1.0, raw))
+        trend = "UP" if score >= 0.20 else "DOWN" if score <= -0.20 else "FLAT"
         self.nse = f
-        self.nse_view = {"trend": ai_model.label(p), "p_up": p, "source": src,
+        self.nse_view = {"trend": trend, "trend_score": round(score, 3), "source": "NSE deterministic features",
                          "pcr": round(f["pcr_oi"], 2), "support": f["_support"],
                          "resistance": f["_resistance"], "max_pain": f["_maxpain"], "ts": ts}
         os.makedirs("data", exist_ok=True)
@@ -92,20 +96,20 @@ class Engine:
         reasons += [f"ATM {r[1]}: {r[2]} (Δprice {r[3]}, ΔOI {r[4]})" for r in rows if r[0] == atm]
         nse = self.nse_view
         if nse:
-            reasons.append(f"NSE AI: {nse['trend']} (p_up {nse['p_up']}, {nse['source']})")
+            reasons.append(f"NSE trend: {nse['trend']} (score {nse['trend_score']:+.2f}, {nse['source']})")
 
         if self.position:
             p = self.position
             cur = snap["opts"].get((p["strike"], p["typ"]))
             if cur:
                 ltp = cur["ltp"]; reason = None
-                p_up = nse["p_up"] if nse else 0.5
-                ai_flip = (p["typ"] == "CE" and p_up <= 1 - C.AI_MIN_CONF) or (p["typ"] == "PE" and p_up >= C.AI_MIN_CONF)
+                nse_trend = nse["trend"] if nse else "FLAT"
+                trend_flip = (p["typ"] == "CE" and nse_trend == "DOWN") or (p["typ"] == "PE" and nse_trend == "UP")
                 if ltp <= p["sl"]: reason = "STOPLOSS HIT"
                 elif ltp >= p["target"]: reason = "TARGET HIT"
                 elif (p["typ"] == "CE" and score <= -C.THRESH) or (p["typ"] == "PE" and score >= C.THRESH):
                     reason = "TREND REVERSAL (Angel OI)"
-                elif ai_flip: reason = "NSE AI TREND FLIPPED"
+                elif trend_flip: reason = "NSE TREND FLIPPED"
                 pnl = round((ltp / p["entry"] - 1) * 100, 2)
                 if reason:
                     self.last = {"action": "EXIT", "symbol": snap.get("symbol", C.SYMBOL), "optionSymbol": p.get("optionSymbol"), "strike": p["strike"], "type": p["typ"], "ltp": ltp,
@@ -123,8 +127,8 @@ class Engine:
             if nse is None:
                 block = "NSE data abhi aaya nahi -> WAIT"
             else:
-                conf = nse["p_up"] if typ == "CE" else 1 - nse["p_up"]
-                if conf < C.AI_MIN_CONF: block = f"NSE AI confidence {conf:.2f} < {C.AI_MIN_CONF} -> WAIT"
+                trend_ok = (typ == "CE" and nse["trend"] == "UP") or (typ == "PE" and nse["trend"] == "DOWN")
+                if not trend_ok: block = f"NSE deterministic trend {nse['trend']} does not confirm {typ} -> WAIT"
                 elif typ == "CE" and 0 <= (nse["resistance"] - snap["spot"]) / snap["spot"] < 0.0015:
                     block = f"Spot resistance {nse['resistance']} ke bahut paas -> CE skip"
                 elif typ == "PE" and 0 <= (snap["spot"] - nse["support"]) / snap["spot"] < 0.0015:
@@ -136,8 +140,8 @@ class Engine:
                 sl = round(entry * (1 - C.SL_PCT), 2); tgt = round(entry * (1 + C.SL_PCT * C.RR), 2)
                 self.position = {"strike": atm, "typ": typ, "entry": entry, "sl": sl, "target": tgt}
                 self.last = {"action": f"BUY_{typ}", "symbol": snap.get("symbol", C.SYMBOL), "optionSymbol": opt.get("symbol"), "strike": atm, "type": typ, "ltp": entry, "entry": entry, "sl": sl,
-                             "target": tgt, "ai_confidence": round(conf, 3), "reasons": reasons,
-                             "exit_rule": "SL / Target / Angel reversal / NSE-AI flip", **self._meta(snap, score)}
+                             "target": tgt, "trend_confirmation": nse["trend"], "reasons": reasons,
+                             "exit_rule": "SL / Target / Angel reversal / NSE trend flip", **self._meta(snap, score)}
                 return self.last
         self.last = {"action": "WAIT", "reasons": reasons, **self._meta(snap, score)}
         return self.last
