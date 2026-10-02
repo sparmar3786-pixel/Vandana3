@@ -1,7 +1,8 @@
-"""Network/API gateway for NSE Algo Signal live market workspace."""
-import threading,time,datetime as dt
+"""Network/API gateway for NSE Algo Signal. PAPER signals only; no order placement."""
+import asyncio,threading,time,datetime as dt,os
 from typing import Optional
-from fastapi import FastAPI,Header,HTTPException,Response
+from fastapi import FastAPI,Header,HTTPException,Response,WebSocket,WebSocketDisconnect
+from fastapi.middleware.gzip import GZipMiddleware
 from pydantic import BaseModel
 import uvicorn
 import config as C
@@ -9,43 +10,42 @@ from angel_client import AngelClient
 from signals import Engine
 from nse_client import NSEClient
 import nse_features
-from strategy_registry import ALL_STRATEGIES
 from nse_mcp import NSEMCP,result_to_csv
-from ai_orchestrator import provider_status, validate_all
-from diagnostics import build_audit, build_diagnostics
+from ai_model import p_up,label
+from ai_orchestrator import provider_status, validate_all, NSE_SITE_URL, _nse_site_evidence
+from market_core import router as market_core_router, ingest_chain, put_spot, evidence as market_evidence, mount_mcp, install_mcp_auth
+from strategy_api import router as strategy_router
+from council import router as council_router
+from notifier import router as alert_router, alert_loop
+from strategy_store import save_oi_snapshot
+from strategy_mcp_server import mount_strategy_mcp
+from engine_contract import engine_state, strategy_state
 
-app=FastAPI(title="NSE Algo Signal API"); eng=Engine(); client=AngelClient(); nse=NSEClient(); nse_mcp=NSEMCP()
-state={"error":None,"nse_error":None,"last_update":None,"angel_message":"Not connected","nse_mcp_error":None}
-prev_chain={"c":None}; workers_started=False
+app=FastAPI(title="NSE Algo Signal API"); app.add_middleware(GZipMiddleware,minimum_size=1024); app.include_router(strategy_router); app.include_router(market_core_router); app.include_router(council_router); app.include_router(alert_router); eng=Engine(); client=AngelClient(); nse=NSEClient(); nse_mcp=NSEMCP()
+state={"error":None,"nse_error":None,"last_update":None,"angel_message":"Not connected","nse_mcp_error":None,"nse_mcp_checked":False}
+prev_chain={"c":None}; workers_started=False; last_oi_save=0.0
+
+# Two read-only MCP servers live in this same Railway/Fly process.
+# /mcp serves the shared market snapshot; /mcp-strategy serves strategy evidence/backtests.
+mount_mcp(app)
+mount_strategy_mcp(app)
+install_mcp_auth(app)
 
 class AIValidationRequest(BaseModel):
     payload:dict = {}
 
 class AngelLoginRequest(BaseModel):
-    clientId:str
+    # The APK uses clientId/pin/totp/apiKey. clientCode is accepted as a
+    # compatibility alias for simple Railway clients.
+    clientId:Optional[str]=None
+    clientCode:Optional[str]=None
     pin:str
     totp:str
     apiKey:Optional[str]=None
 
-
-class LegacyAngelLoginRequest(BaseModel):
-    clientId:Optional[str]=None
-    client_id:Optional[str]=None
-    clientCode:Optional[str]=None
-    clientcode:Optional[str]=None
-    pin:Optional[str]=None
-    password:Optional[str]=None
-    totp:Optional[str]=None
-    apiKey:Optional[str]=None
-    api_key:Optional[str]=None
-
-
-def _legacy_value(body: LegacyAngelLoginRequest, *names: str) -> str:
-    for name in names:
-        value = getattr(body, name, None)
-        if value:
-            return str(value).strip()
-    return ""
+    @property
+    def client_code(self) -> str:
+        return (self.clientId or self.clientCode or "").strip()
 
 def market_open():
     now=dt.datetime.now(dt.timezone(dt.timedelta(hours=5,minutes=30)))
@@ -59,106 +59,112 @@ def start_workers():
     workers_started = True
     threading.Thread(target=loop, daemon=True, name="angel-data-loop").start()
     threading.Thread(target=nse_loop, daemon=True, name="nse-data-loop").start()
+    asyncio.create_task(alert_loop(), name="qualified-alert-loop")
 
 def _ensure_angel():
-    # Manual APK login is the normal path; do not repeatedly call Angel when
-    # no server credentials are configured.
-    if client.api is None:
-        if not (C.API_KEY and C.CLIENT and C.PIN):
-            return
+    # App login is the normal path. Only auto-login on startup when complete
+    # server-side Angel credentials are configured in Railway environment.
+    if client.api is None and C.API_KEY and C.CLIENT and C.PIN and C.TOTP_SECRET:
         client.login()
-        state["angel_message"]="Connected using server credentials."
-    else:
-        client.ensure_session()
+        state["angel_message"]="Connected using server credentials (6h session reuse)."
 
 def loop():
+    global last_oi_save
     while True:
         try:
             _ensure_angel()
-            if client.api is not None and market_open():
-                eng.update(client.snapshot())
-                state["last_update"]=time.time()
-                state["error"]=None
-                state["angel_message"]="Angel One connected."
+            if market_open():
+                snap=client.snapshot()
+                eng.update(snap); state["last_update"]=time.time(); state["error"]=None
+                if time.time()-last_oi_save >= max(60, min(180, int(C.NSE_POLL_SEC))):
+                    try:
+                        save_oi_snapshot(C.SYMBOL, snap)
+                        last_oi_save=time.time()
+                    except Exception:
+                        pass
         except Exception as e:
-            state["error"]=str(e)[:500]
-            state["angel_message"]="Angel connection failed: " + str(e)[:180]
-            client.api=None
+            state["error"]=str(e); state["angel_message"]="Angel connection failed."; client.api=None; time.sleep(10)
         time.sleep(C.POLL_SEC)
 
 def nse_loop():
     while True:
         try:
             if market_open():
-                ch=nse.fetch(C.SYMBOL); features=nse_features.compute(ch,prev_chain["c"]); prev_chain["c"]=ch
-                eng.set_nse(features,ch["ts"]); state["nse_error"]=None
+                ch=nse.fetch(C.SYMBOL)
+                features=nse_features.compute(ch,prev_chain["c"]); prev_chain["c"]=ch
+                eng.set_nse(features,ch["ts"])
+                ingest_chain(ch,"nse")
+                state["nse_error"]=None
         except Exception as e: state["nse_error"]=str(e)
         time.sleep(C.NSE_POLL_SEC)
 
-def auth(x_token:str):
-    if x_token!=C.API_TOKEN: raise HTTPException(401,"bad token")
+def auth(x_token: str = None, x_app_key: str = None):
+    expected = (C.API_TOKEN or "").strip()
+    provided = (x_token or x_app_key or "").strip()
+    if expected and provided != expected:
+        raise HTTPException(
+            401,
+            detail={
+                "code": "APP_TOKEN_REJECTED",
+                "message": "Terminal app token rejected. This is not the Angel One SmartAPI key."
+            },
+        )
 
 @app.get("/health")
 def health():
-    return {"ok":True,"market_open":market_open(),"angel_connected":client.api is not None,
-            "angel_websocket":client.live_connected,"angel_last_tick":client.live_last_tick,
-            "angel_message":state["angel_message"],"nse_mcp":"configured",
-            "last_update":state["last_update"],"error":state["error"],
-            "nse_error":state["nse_error"],"nse_mcp_error":state["nse_mcp_error"]}
-
-
-
-@app.post("/api/live/angel/login")
-def legacy_angel_login(body:LegacyAngelLoginRequest,x_token:str=Header(None)):
-    """Backward-compatible login route for older Vandana2 APK builds.
-
-    It deliberately does not read or require TERMINAL_API_KEY. Credentials are
-    forwarded only to the same server-side SmartAPI login used by /v1/angel/login.
-    """
-    auth(x_token)
-    client_id=_legacy_value(body,"clientId","client_id","clientCode","clientcode")
-    pin=_legacy_value(body,"pin","password")
-    totp=_legacy_value(body,"totp")
-    api_key=_legacy_value(body,"apiKey","api_key")
-    if not client_id or not pin or not api_key or len(totp)!=6 or not totp.isdigit():
-        raise HTTPException(400,"Client ID, PIN, SmartAPI API key and current 6-digit TOTP are required.")
-    try:
-        result=client.login(api_key=api_key,client_code=client_id,pin=pin,totp=totp)
-        state["angel_message"]="Angel One connected."; state["error"]=None
-        return {"ok":True,"connected":True,"message":"Angel One connected.","profile":result.get("data",{}).get("clientcode")}
-    except Exception as e:
-        client.api=None
-        state["angel_message"]="Angel connection failed: " + str(e)[:180]
-        state["error"]=str(e)[:500]
-        raise HTTPException(401,detail=state["error"])
+    return {"ok":True,"auth_mode":"optional" if not C.API_TOKEN else "required","market_open":market_open(),"angel_connected":client.api is not None,"angel_message":state["angel_message"],"nse_mcp":"configured","last_update":state["last_update"],"error":state["error"],"nse_error":state["nse_error"],"nse_mcp_error":state["nse_mcp_error"]}
 
 @app.post("/v1/angel/login")
-def angel_login(body:AngelLoginRequest,x_token:str=Header(None)):
-    auth(x_token)
+@app.post("/angel/login")
+def angel_login(body:AngelLoginRequest,x_token:str=Header(None),x_app_key:str=Header(None)):
+    auth(x_token,x_app_key)
+    client_code=body.client_code
+    if not client_code: raise HTTPException(400,"Client ID is required.")
     if len(body.totp)!=6 or not body.totp.isdigit(): raise HTTPException(400,"TOTP must be the current 6-digit code.")
     try:
-        result=client.login(api_key=body.apiKey or C.API_KEY,client_code=body.clientId,pin=body.pin,totp=body.totp)
-        state["angel_message"]="Angel One connected."; state["error"]=None
-        return {"ok":True,"connected":True,"message":"Angel One connected.","profile":result.get("data",{}).get("clientcode")}
-    except Exception as e:
+        result=client.login(api_key=body.apiKey or C.API_KEY,client_code=client_code,pin=body.pin,totp=body.totp)
+        reused=bool(result.get("data",{}).get("session_reused"))
+        state["angel_message"]="Angel One session reused (6h)." if reused else "Angel One connected."
+        state["error"]=None
+        return {"ok":True,"connected":True,"session_reused":reused,"message":"Existing Angel session reused." if reused else "Angel One connected.","profile":result.get("data",{}).get("clientcode")}
+    except Exception as ex:
         client.api=None
-        state["angel_message"]="Angel connection failed: " + str(e)[:180]
-        state["error"]=str(e)[:500]
-        raise HTTPException(401,detail=state["error"])
+        client.session_started=0.0
+        state["angel_message"]="Angel connection failed."
+        safe = str(ex).replace(body.apiKey or "", "[REDACTED]").replace(body.pin, "[REDACTED]").replace(body.totp, "[REDACTED]")
+        state["error"]=safe[:300]
+        raise HTTPException(
+            401,
+            detail={
+                "code": "ANGEL_LOGIN_REJECTED",
+                "message": safe[:300] or "Angel login failed. Check Client ID, PIN, TOTP and SmartAPI key."
+            },
+        )
 
 @app.get("/v1/angel/status")
-def angel_status(x_token:str=Header(None)):
-    auth(x_token)
-    return {"connected":client.api is not None,"websocket":client.live_connected,
-            "last_tick":client.live_last_tick,"message":state["angel_message"],
-            "last_update":state["last_update"],"error":state["error"] or client.last_error}
+@app.get("/angel/status")
+def angel_status(x_token:str=Header(None),x_app_key:str=Header(None)):
+    auth(x_token,x_app_key); return {"connected":client.api is not None,"message":state["angel_message"],"last_update":state["last_update"],"error":state["error"]}
+@app.websocket("/v1/ws")
+async def native_market_websocket(websocket: WebSocket):
+    token = (websocket.query_params.get("token") or "").strip()
+    expected = (C.API_TOKEN or "").strip()
+    if expected and token != expected:
+        await websocket.close(code=1008, reason="APP_TOKEN_REJECTED")
+        return
+    await websocket.accept()
+    try:
+        while True:
+            await websocket.send_json(terminal_snapshot())
+            await asyncio.sleep(1.0)
+    except WebSocketDisconnect:
+        return
+    except Exception:
+        try:
+            await websocket.close(code=1011)
+        except Exception:
+            pass
 
-@app.get("/v1/angel/live")
-def angel_live(x_token:str=Header(None)):
-    auth(x_token)
-    return {"connected":client.api is not None,"websocket":client.live_connected,
-            "last_tick":client.live_last_tick,"error":client.live_error,
-            "ticks":list(client.live_ticks.values())[-200:]}
 
 
 def angel_required():
@@ -169,6 +175,12 @@ def angel_required():
 def angel_commodities(x_token:str=Header(None)):
     auth(x_token); angel_required()
     try: return client.commodity_quotes()
+    except Exception as e: raise HTTPException(502,str(e))
+
+@app.get("/v1/angel/indices")
+def angel_indices(x_token:str=Header(None)):
+    auth(x_token); angel_required()
+    try: return client.index_catalog_quotes()
     except Exception as e: raise HTTPException(502,str(e))
 
 @app.get("/v1/angel/market")
@@ -182,7 +194,7 @@ def angel_market(x_token:str=Header(None)):
 @app.get("/v1/angel/candles")
 def angel_candles(exchange:str="NSE",token:str="99926000",interval:str="FIVE_MINUTE",days:int=1,x_token:str=Header(None)):
     auth(x_token); angel_required()
-    allowed={"ONE_MINUTE","TWO_MINUTE","THREE_MINUTE","FIVE_MINUTE","TEN_MINUTE","FIFTEEN_MINUTE","THIRTY_MINUTE","ONE_HOUR","ONE_DAY"}
+    allowed={"ONE_MINUTE","THREE_MINUTE","FIVE_MINUTE","TEN_MINUTE","FIFTEEN_MINUTE","THIRTY_MINUTE","ONE_HOUR","ONE_DAY"}
     if interval not in allowed: raise HTTPException(400,"Unsupported interval")
     try: return client.candles(exchange,token,interval,days)
     except Exception as e: raise HTTPException(502,str(e))
@@ -190,60 +202,43 @@ def angel_candles(exchange:str="NSE",token:str="99926000",interval:str="FIVE_MIN
 @app.get("/v1/option-chain")
 def unified_option_chain(symbol:str="NIFTY",count:int=10,x_token:str=Header(None)):
     auth(x_token); angel_required()
-    symbol=symbol.upper().replace(" ","")
-    aliases={"MIDCAPSELECT":"MIDCPNIFTY","BANKNIFTY":"BANKNIFTY"}
-    symbol=aliases.get(symbol,symbol)
+    aliases={"NIFTY 50":"NIFTY","NIFTYBANK":"BANKNIFTY","BANK NIFTY":"BANKNIFTY","MIDCAP SELECT":"MIDCPNIFTY"}
+    key=symbol.upper().replace(" ","")
+    key=aliases.get(symbol.upper(), aliases.get(key,key))
     try:
-        result=client.option_chain_rows(symbol=symbol,count=max(5,min(count,25)))
+        result=client.option_chain_rows(symbol=key,count=max(5,min(count,25)))
         rows=result.get("rows",[]) if isinstance(result,dict) else []
-        if rows:
-            return {**result,"source":"Angel One SmartAPI"}
-    except Exception as angel_error:
-        if symbol in {"SENSEX","BANKEX"}:
-            raise HTTPException(502,str(angel_error))
-        try:
-            nse_symbol={"MIDCPNIFTY":"MIDCPNIFTY"}.get(symbol,symbol)
-            n=nse.fetch(nse_symbol)
-            flat=[]
-            for item in n.get("rows",[]):
-                for typ,key in (("CE","ce"),("PE","pe")):
-                    leg=item.get(key) or {}
-                    flat.append({
-                        "strike":item.get("strike"),"type":typ,
-                        "symbol":leg.get("symbol"),
-                        "token":leg.get("symbolToken"),
-                        "ltp":leg.get("ltp"),"open":leg.get("open"),
-                        "high":leg.get("high"),"low":leg.get("low"),
-                        "close":leg.get("close"),"oi":leg.get("oi"),
-                        "oiChange":leg.get("chg_oi"),"volume":leg.get("vol"),
-                    })
-            if flat:
-                return {"symbol":symbol,"spot":n.get("spot"),"atm":min((x["strike"] for x in flat),key=lambda x:abs(x-float(n.get("spot",x)))),"expiry":n.get("expiry"),"rows":flat,"source":"NSE"}
-        except Exception as nse_error:
-            raise HTTPException(502,f"Option chain unavailable: Angel={angel_error}; NSE={nse_error}")
-        raise HTTPException(502,str(angel_error))
-
+        return {**result,"source":"Angel One SmartAPI","rows":rows}
+    except Exception as e:
+        raise HTTPException(502,"Option chain unavailable: "+str(e))
 
 @app.get("/v1/angel/option-chain")
 def angel_option_chain(symbol:str="NIFTY",count:int=200,x_token:str=Header(None)):
     auth(x_token); angel_required()
     allowed={"NIFTY","BANKNIFTY","FINNIFTY","MIDCPNIFTY","MIDCAPSELECT","SENSEX","BANKEX"}
     symbol=symbol.upper().replace(" ","")
-    if symbol=="MIDCAPSELECT": symbol="MIDCPNIFTY"
     if symbol not in allowed: raise HTTPException(400,"Unsupported index")
-    try: return client.option_chain_rows(symbol=symbol,count=max(10,min(count,250)))
-    except Exception as e: raise HTTPException(502,str(e))
-
-@app.get("/v1/index-components")
-def index_components(index:str="NIFTY",x_token:str=Header(None)):
-    auth(x_token)
-    allowed={"NIFTY","NIFTY 50","BANKNIFTY","BANK NIFTY","FINNIFTY","MIDCPNIFTY"}
-    if index.upper() not in allowed: raise HTTPException(400,"Unsupported index")
     try:
-        return nse.index_components(index)
-    except Exception as e:
-        raise HTTPException(502,"Index constituents unavailable: "+str(e))
-
+        result=client.option_chain_rows(symbol=symbol,count=max(10,min(count,250)))
+        # Angel's Option Greeks endpoint is currently NSE-only. Enrich NSE rows when live expiry data is available.
+        if symbol in {"NIFTY","BANKNIFTY","FINNIFTY","MIDCPNIFTY","MIDCAPSELECT"} and result.get("expiry"):
+            try:
+                expiry_value=str(result["expiry"])
+                try:
+                    expiry_value=dt.datetime.fromisoformat(expiry_value).strftime("%d%b%Y").upper()
+                except Exception:
+                    expiry_value=expiry_value.upper()
+                gd=client.option_greeks(symbol, expiry_value)
+                greeks=gd.get("data",[]) if isinstance(gd,dict) else []
+                gm={(float(g.get("strikePrice")),str(g.get("optionType")).upper()):g for g in greeks if isinstance(g,dict) and g.get("strikePrice") is not None}
+                for row in result.get("rows",[]):
+                    g=gm.get((float(row.get("strike")),str(row.get("type")).upper()))
+                    if g:
+                        row.update({"delta":g.get("delta"),"gamma":g.get("gamma"),"theta":g.get("theta"),"vega":g.get("vega"),"iv":g.get("impliedVolatility")})
+            except Exception:
+                pass
+        return result
+    except Exception as e: raise HTTPException(502,str(e))
 
 @app.get("/v1/angel/oi")
 def angel_oi(token:str,interval:str="THREE_MINUTE",hours:int=6,x_token:str=Header(None)):
@@ -283,17 +278,41 @@ def angel_greeks(name:str="NIFTY",expiry:str="",x_token:str=Header(None)):
     try: return client.option_greeks(name,expiry)
     except Exception as e: raise HTTPException(502,str(e))
 
+@app.get("/v1/mcp/status")
+def mcp_status(x_token:str=Header(None)):
+    auth(x_token)
+    return {
+        "market_mcp":{"mounted":True,"endpoint":"/mcp","auth":"x-mcp-token or Bearer"},
+        "strategy_mcp":{"mounted":True,"endpoint":"/mcp-strategy","auth":"x-mcp-token or Bearer"},
+        "official_nse_mcp":{"configured":True,"endpoint":nse_mcp.url},
+        "paper_only":True,"orders_enabled":False,
+    }
+
 @app.get("/v1/nse/mcp/tools")
 def nse_mcp_tools(x_token:str=Header(None)):
     auth(x_token)
     try:
         tools=nse_mcp.tools()
+        state["nse_mcp_checked"]=True
         state["nse_mcp_error"]=None
         return {"connected":True,"endpoint":nse_mcp.url,"tools":[{"name":t.get("name"),"description":t.get("description")} for t in tools]}
     except Exception as e:
+        state["nse_mcp_checked"]=True
         state["nse_mcp_error"]=str(e)
         raise HTTPException(502,"NSE MCP unavailable")
 
+@app.get("/v1/nse/mcp/context")
+def nse_mcp_context(symbol:str="NIFTY",x_token:str=Header(None)):
+    auth(x_token)
+    try:
+        data=nse_mcp.context(symbol.upper())
+        state["nse_mcp_checked"]=True
+        state["nse_mcp_error"]=None
+        return data
+    except Exception as e:
+        state["nse_mcp_checked"]=True
+        state["nse_mcp_error"]=str(e)
+        return {"connected":False,"endpoint":nse_mcp.url,"tool_count":0,"tools":[],"data":[],"error":str(e)[:500]}
 @app.get("/v1/nse/option-chain.csv")
 def nse_option_chain_csv(symbol:str="NIFTY",expiry:Optional[str]=None,x_token:str=Header(None)):
     auth(x_token)
@@ -310,60 +329,58 @@ def nse_option_chain_csv(symbol:str="NIFTY",expiry:Optional[str]=None,x_token:st
         state["nse_mcp_error"]=str(e)
         raise HTTPException(502,str(e))
 
-@app.get("/v1/ai/status")
-def ai_status(x_token:str=Header(None)):
-    auth(x_token)
-    return {"providers":provider_status(),"configured":sum(1 for x in provider_status() if x["configured"])}
+def _strategy_refresh(index: str = "NIFTY"):
+    return strategy_state(client, eng, index)
 
+@app.get("/v1/strategy/refresh")
+def strategy_refresh(index:str="NIFTY",x_token:str=Header(None)):
+    auth(x_token)
+    return _strategy_refresh(index)
+
+@app.get("/v1/ai/context")
+def ai_context(index:str="NIFTY",x_token:str=Header(None)):
+    auth(x_token)
+    terminal=terminal_snapshot()
+    try:
+        mcp=nse_mcp.context(index.upper())
+        state["nse_mcp_checked"]=True
+        state["nse_mcp_error"]=None
+    except Exception as e:
+        mcp={"connected":False,"endpoint":nse_mcp.url,"tool_count":0,"tools":[],"data":[],"error":str(e)[:500]}
+        state["nse_mcp_checked"]=True
+        state["nse_mcp_error"]=str(e)
+    official=_nse_site_evidence({"terminal":terminal,"symbol":index})
+    strategy=_strategy_refresh(index)
+    market=terminal.get("market") or {}
+    return {"terminal":terminal,"strategy":strategy,"three_sources":{
+        "angel_api":{"connected":bool((terminal.get("angel_api") or {}).get("connected")),"data":terminal.get("data"),"option_chain":terminal.get("option_chain")},
+        "nse_mcp":mcp,
+        "nse_internet":{"connected":official.get("connected",False),"evidence":official}
+    },"market_evidence":{
+        "index":index.upper(),"spot":market.get("spot"),"atm":market.get("atm"),
+        "pcr":strategy.get("pcr"),"top_ce_oi":strategy.get("highest_ce_oi",[]),"top_pe_oi":strategy.get("highest_pe_oi",[]),
+        "trend":strategy.get("trend"),"support":strategy.get("support"),"resistance":strategy.get("resistance"),
+        "max_pain":strategy.get("max_pain")
+    },"ai_rule":"Reconcile Angel API + official NSE MCP + Internet evidence. Missing or conflicting evidence forces WAIT."}
 @app.post("/v1/ai/validate")
 def ai_validate(body:AIValidationRequest,x_token:str=Header(None)):
     auth(x_token)
-    payload=dict(body.payload or {})
-    try:
-        snap=terminal_snapshot()
-    except Exception:
-        snap={}
-    if not payload:
-        payload=snap
-    payload["engine_decision"]=snap.get("signals",{}) if isinstance(snap,dict) else {}
-    payload["strategy_evidence"]=getattr(eng,"strategy_evidence",[])[:120]
+    payload=body.payload if isinstance(body.payload,dict) else {}
     try:
         return validate_all(payload)
     except Exception as e:
-        providers=provider_status()
-        for p in providers:
-            p["status"]="unavailable"
-            p["error"]="AI validation service unavailable: "+str(e)[:180]
-        return {"final":"NO QUALIFYING TRADE","providers":providers,"configured":0,"total":len(providers),"error":"AI validation service unavailable"}
+        return {"final":"WAIT","cross_verified":False,"reason":"AI orchestration failed safely; local evidence path remains active.",
+                "configured":0,"successful":0,"parsed_states":0,"total":6,"providers":[],
+                "local_fallback":{"status":"error_local","text":str(e)[:300]}}
 
 @app.get("/v1/diagnostics")
 def diagnostics(x_token:str=Header(None)):
-    auth(x_token)
-    snapshot_state = dict(state)
-    snapshot_state["market_open"] = market_open()
-    return build_diagnostics(
-        state=snapshot_state,
-        engine=eng,
-        registry_count=len(ALL_STRATEGIES),
-        angel_connected=client.api is not None,
-        nse_mcp_connected=state["nse_mcp_error"] is None,
-        ai_providers=provider_status(),
-    )
-
+    auth(x_token); providers=ai_status(x_token)["providers"]; ev=getattr(eng,"strategy_evidence",[]) if hasattr(eng,"strategy_evidence") else []
+    return {"angel":{"connected":client.api is not None,"message":state["angel_message"]},"nse":{"available":state["nse_error"] is None,"error":state["nse_error"]},"ai":{"configured":sum(1 for p in providers if p["configured"]),"providers":providers},"strategies":{"registered":len(ev),"evaluated":len(ev),"active":sum(1 for x in ev if isinstance(x,dict) and x.get("state")=="active"),"unavailable":sum(1 for x in ev if isinstance(x,dict) and x.get("state")=="unavailable"),"not_evaluated":0}}
 
 @app.get("/v1/audit/latest")
 def latest_audit(x_token:str=Header(None)):
-    auth(x_token)
-    return build_audit(eng, len(ALL_STRATEGIES))
-
-
-@app.get("/v1/strategies")
-def strategies(x_token:str=Header(None)):
-    auth(x_token)
-    evidence = eng.strategy_evidence if isinstance(getattr(eng, "strategy_evidence", None), list) else []
-    active = sum(1 for x in evidence if x.get("state") == "active")
-    unavailable = sum(1 for x in evidence if x.get("state") == "unavailable")
-    return {"count": len(ALL_STRATEGIES), "active": active, "inactive": len(ALL_STRATEGIES)-active-unavailable, "unavailable": unavailable, "registry": ALL_STRATEGIES, "evidence": evidence, "health": build_diagnostics(state={**state, "market_open": market_open()}, engine=eng, registry_count=len(ALL_STRATEGIES), angel_connected=client.api is not None, nse_mcp_connected=state["nse_mcp_error"] is None, ai_providers=provider_status())["strategies"]}
+    auth(x_token); last=eng.last if isinstance(eng.last,dict) else {}; return {"action":last.get("action","WAIT"),"reasons":last.get("reasons",[]),"timestamp":state["last_update"]}
 
 @app.get("/signal")
 def signal(x_token:str=Header(None)): auth(x_token); return terminal_snapshot()
@@ -372,8 +389,40 @@ def signal(x_token:str=Header(None)): auth(x_token); return terminal_snapshot()
 def terminal_snapshot_endpoint(x_token:str=Header(None)): auth(x_token); return terminal_snapshot()
 
 def terminal_snapshot():
-    last=eng.last if isinstance(eng.last,dict) else {}; nse_view=eng.nse_view if isinstance(eng.nse_view,dict) else {}
-    return {"ts":time.time(),"market_open":market_open(),"connection":{"angel":client.api is not None,"nse":state["nse_error"] is None,"server":True,"last_update":state["last_update"],"error":state["error"],"nse_error":state["nse_error"],"angel_message":state["angel_message"]},"market":{"symbol":C.SYMBOL,"spot":last.get("spot"),"atm":last.get("strike"),"action":last.get("action","WAIT"),"ltp":last.get("ltp")},"signals":last,"oi_lab":nse_view,"option_chain":last.get("chain",last.get("opts")),"charts":{"spot":last.get("spot"),"ltp":last.get("ltp"),"timestamp":state["last_update"],"source":"Angel One SmartAPI","endpoint":"/v1/angel/candles"},"nse":nse_view,"angel_data":{"market_endpoint":"/v1/angel/market","candles_endpoint":"/v1/angel/candles","option_chain_endpoint":"/v1/angel/option-chain","oi_endpoint":"/v1/angel/oi","search_endpoint":"/v1/angel/search","portfolio_endpoint":"/v1/angel/portfolio","gainers_losers_endpoint":"/v1/angel/gainers-losers","oi_buildup_endpoint":"/v1/angel/oi-buildup","greeks_endpoint":"/v1/angel/greeks"},"nse_mcp":{"status":"official NSE Streamable HTTP MCP","endpoint":nse_mcp.url,"connected":state["nse_mcp_error"] is None,"error":state["nse_mcp_error"],"csv_endpoint":"/v1/nse/option-chain.csv"},"angel_api":{"connected":client.api is not None,"message":state["angel_message"]},"data":last,"instruments":{"source":"Angel One SmartAPI instrument master","loaded":bool(client.chain),"expiry":str(client.expiry) if client.expiry else None,"strike_count":len(client.strikes)},"watchlist":{"source":"Angel One SmartAPI","items":[]},"search":{"source":"Angel One SmartAPI","items":[]},"commodity":{"source":"Angel One SmartAPI","items":[]},"market_details":nse_view,"news":{"source":"server-side news adapter","items":[]},"settings":{"symbol":C.SYMBOL,"poll_sec":C.POLL_SEC,"nse_poll_sec":C.NSE_POLL_SEC},"ai":{"providers":provider_status(),"configured":sum(1 for x in provider_status() if x["configured"])},"more":{"paper_only":False,"orders_enabled":False},"error":state["error"],"nse_error":state["nse_error"]}
+    last=eng.last if isinstance(eng.last,dict) else {}
+    nse_view=eng.nse_view if isinstance(eng.nse_view,dict) else {}
+    live_engine=engine_state(client, eng, C.SYMBOL)
+    nse_status = "NOT CHECKED"
+    if state["nse_mcp_checked"]:
+        nse_status = "CONNECTED" if state["nse_mcp_error"] is None else "UNAVAILABLE"
+    return {"ts":time.time(),"market_open":market_open(),
+            "connection":{"angel":client.api is not None,"nse":state["nse_error"] is None,"server":True,
+                          "last_update":state["last_update"],"error":state["error"],"nse_error":state["nse_error"],
+                          "angel_message":state["angel_message"]},
+            "market":{"symbol":live_engine.get("symbol",C.SYMBOL),"spot":live_engine.get("index_ltp"),
+                      "atm":live_engine.get("atm"),"action":live_engine.get("signal_status","WAIT"),
+                      "ltp":live_engine.get("option_ltp")},
+            "engine_state":live_engine,"signals":last,"oi_lab":nse_view,
+            "option_chain":last.get("chain",last.get("opts")),
+            "charts":{"spot":live_engine.get("index_ltp"),"ltp":live_engine.get("option_ltp"),
+                      "timestamp":state["last_update"],"source":"Angel One SmartAPI","endpoint":"/v1/angel/candles"},
+            "nse":nse_view,
+            "angel_data":{"market_endpoint":"/v1/angel/market","candles_endpoint":"/v1/angel/candles",
+                          "option_chain_endpoint":"/v1/angel/option-chain","oi_endpoint":"/v1/angel/oi",
+                          "search_endpoint":"/v1/angel/search","portfolio_endpoint":"/v1/angel/portfolio",
+                          "gainers_losers_endpoint":"/v1/angel/gainers-losers","oi_buildup_endpoint":"/v1/angel/oi-buildup",
+                          "greeks_endpoint":"/v1/angel/greeks"},
+            "nse_mcp":{"status":"official NSE Streamable HTTP MCP","state":nse_status,"endpoint":nse_mcp.url,
+                       "connected":state["nse_mcp_checked"] and state["nse_mcp_error"] is None,
+                       "error":state["nse_mcp_error"],"csv_endpoint":"/v1/nse/option-chain.csv"},
+            "angel_api":{"connected":client.api is not None,"message":state["angel_message"]},"data":last,
+            "instruments":{"source":"Angel One SmartAPI instrument master","loaded":bool(client.chain),
+                           "expiry":str(client.expiry) if client.expiry else None,"strike_count":len(client.strikes)},
+            "watchlist":{"source":"Angel One SmartAPI","items":[]},"search":{"source":"Angel One SmartAPI","items":[]},
+            "commodity":{"source":"Angel One SmartAPI","items":[]},"market_details":nse_view,
+            "news":{"source":"server-side news adapter","items":[]},
+            "settings":{"symbol":C.SYMBOL,"poll_sec":C.POLL_SEC,"nse_poll_sec":C.NSE_POLL_SEC},
+            "more":{"paper_only":True,"orders_enabled":False},"error":state["error"],"nse_error":state["nse_error"]}
 
 if __name__=="__main__":
     uvicorn.run(app,host="0.0.0.0",port=8000)
