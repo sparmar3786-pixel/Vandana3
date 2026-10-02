@@ -1,4 +1,5 @@
 name: Build NSE Algo Trading APK
+# Rebuild after Flutter SVG dependency fix
 on:
   push:
     branches: [main, feature-v2-ui-polish-market-chart, feature-v2-ui-polish-market-chart-fixed, feature/strategy-master-377, vandana4]
@@ -16,7 +17,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Set up Java 17
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: "17"
