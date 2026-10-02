@@ -9,3 +9,9 @@ numpy
 python-dotenv
 joblib
 mcp==1.28.0
+
+pydantic>=2.8,<3
+pydantic-settings>=2.5,<3
+httpx>=0.27,<1
+openai>=1.50,<3
+loguru>=0.7,<1
