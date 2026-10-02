@@ -38,7 +38,6 @@ class DiagnosticsTests(unittest.TestCase):
             registry_count=426,
             angel_connected=True,
             nse_mcp_connected=True,
-            ai_providers=[],
         )
         self.assertTrue(d["ok"])
         self.assertEqual(d["signal"]["action"], "WAIT")
