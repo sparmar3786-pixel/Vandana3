@@ -33,7 +33,7 @@ def _auth(token):
 def blocks(x_token:str=Header(None)):
     _auth(x_token)
     from strategy_engine import ALLOWED_BLOCKS
-    return {"blocks":sorted(ALLOWED_BLOCKS),"ai_may_select_only":False,"arbitrary_code":False}
+    return {"blocks":sorted(ALLOWED_BLOCKS),"model_selection":False,"arbitrary_code":False}
 
 @router.post("/validate")
 def validate(body:EvaluateRequest,x_token:str=Header(None)):
