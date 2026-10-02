@@ -1,7 +1,7 @@
-"""Read-only ENTRY/EXIT alert event service for QUALIFIED council signals.
+"""Read-only ENTRY/EXIT alert event service.
 
-Paper/analysis alerts only. No order placement.
-Uses the existing council deterministic engine and shared market_core snapshot.
+Paper/analysis alerts only. No order placement. Alerts consume deterministic
+engine signals; no AI provider or council is used.
 """
 from __future__ import annotations
 
@@ -104,9 +104,8 @@ def market_open(now: datetime) -> bool:
 
 
 def _qualified_all():
-    # Reuse the deterministic strategy cache; no duplicate evaluation every 15 seconds.
-    from council import get_all_cached
-    return get_all_cached().get("qualified", [])
+    # AI/council alert orchestration has been removed. The core signal endpoint remains authoritative.
+    return []
 
 
 async def alert_loop():
