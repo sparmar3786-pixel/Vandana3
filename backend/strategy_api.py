@@ -1,4 +1,4 @@
-"""FastAPI router for deterministic JSON strategies and six-AI evidence verification."""
+"""FastAPI router for deterministic JSON strategies and backtesting."""
 from __future__ import annotations
 from typing import Any
 from fastapi import APIRouter, Header, HTTPException
@@ -7,7 +7,6 @@ import config as C
 from strategy_engine import evaluate_strategy, run_backtest, validate_strategy, approve_test
 from strategy_store import get_version, save_version
 from strategy_pipeline import split_train_test
-from strategy_ai_verifier import verify_engine_result
 
 router=APIRouter(prefix="/v1/strategy",tags=["strategy"])
 
@@ -20,9 +19,6 @@ class BacktestRequest(BaseModel):
     bars:list[dict]
     brokerage:float=0.0
     slippage:float=0.0
-
-class VerifyRequest(BaseModel):
-    engine_result:dict
 
 class LockRequest(BaseModel):
     strategy:dict
@@ -37,7 +33,7 @@ def _auth(token):
 def blocks(x_token:str=Header(None)):
     _auth(x_token)
     from strategy_engine import ALLOWED_BLOCKS
-    return {"blocks":sorted(ALLOWED_BLOCKS),"ai_may_select_only":True,"arbitrary_code":False}
+    return {"blocks":sorted(ALLOWED_BLOCKS),"ai_may_select_only":False,"arbitrary_code":False}
 
 @router.post("/validate")
 def validate(body:EvaluateRequest,x_token:str=Header(None)):
@@ -65,12 +61,6 @@ def backtest(body:BacktestRequest,x_token:str=Header(None)):
                 "approval":approval,"lookahead_safe":True,
                 "test_seen_by_ai":False}
     except Exception as e: raise HTTPException(400,str(e))
-
-@router.post("/ai-verify")
-def ai_verify(body:VerifyRequest,x_token:str=Header(None)):
-    _auth(x_token)
-    try: return verify_engine_result(body.engine_result)
-    except Exception as e: raise HTTPException(500,str(e))
 
 @router.post("/lock")
 def lock(body:LockRequest,x_token:str=Header(None)):
