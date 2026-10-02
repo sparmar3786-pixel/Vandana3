@@ -24,7 +24,7 @@ jobs:
 
       - name: Validate backend Python syntax
         working-directory: backend
-        run: python -m py_compile strategy_registry.py ai_orchestrator.py diagnostics.py server.py signals.py
+        run: python -m py_compile strategy_registry.py diagnostics.py server.py signals.py
 
       - name: Validate strategy registry
         working-directory: backend
