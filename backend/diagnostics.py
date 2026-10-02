@@ -55,15 +55,10 @@ def strategy_health(evidence: Any, registry_count: int) -> dict[str, Any]:
 
 def build_diagnostics(*, state: dict[str, Any], engine: Any,
                       registry_count: int, angel_connected: bool,
-                      nse_mcp_connected: bool, ai_providers: Any) -> dict[str, Any]:
+                      nse_mcp_connected: bool) -> dict[str, Any]:
     last = engine.last if isinstance(getattr(engine, "last", None), dict) else {}
     evidence = getattr(engine, "strategy_evidence", [])
     last_update = state.get("last_update")
-    provider_rows = ai_providers if isinstance(ai_providers, list) else []
-    configured = sum(
-        1 for p in provider_rows
-        if isinstance(p, dict) and p.get("configured") is True
-    )
     return {
         "ok": True,
         "server": {"state": "healthy"},
@@ -93,12 +88,6 @@ def build_diagnostics(*, state: dict[str, Any], engine: Any,
             "action": last.get("action", "WAIT"),
             "ts": last.get("ts"),
             "reasons": list(last.get("reasons", []))[:20],
-        },
-        "ai": {
-            "total": len(provider_rows),
-            "configured": configured,
-            "ready": configured > 0,
-            "providers": provider_rows,
         },
         "errors": [
             x for x in [state.get("error"), state.get("nse_error"),
