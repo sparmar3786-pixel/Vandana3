@@ -43,7 +43,6 @@ def _normalise(sig: dict) -> dict:
     out = dict(sig)
     out["direction"] = _direction(sig)
     out["type"] = _type(sig)
-    out["ai_take"] = int(sig.get("ai_take", sig.get("take", 0)) or 0)
     return out
 
 
@@ -54,7 +53,7 @@ def emit(kind: str, sig: dict, reason: str, ltp=None):
     name = f"{sig['index']} {sig['direction']} {int(float(sig['strike']))}{sig['type']}"
     if kind == "ENTRY":
         title = f"ENTRY {name}"
-        body = f"Entry {sig.get('entry')} | SL {sig.get('sl')} | Target {sig.get('target')} | AI {sig['ai_take']}/6"
+        body = f"Entry {sig.get('entry')} | SL {sig.get('sl')} | Target {sig.get('target')}"
     else:
         title = f"EXIT {name}"
         body = f"{reason} | LTP {ltp} | Entry {sig.get('entry')}"
@@ -105,7 +104,7 @@ def market_open(now: datetime) -> bool:
 
 
 def _qualified_all():
-    # Reuse council's 30-second aggregate cache; no fresh AI round every 15 seconds.
+    # Reuse the deterministic strategy cache; no duplicate evaluation every 15 seconds.
     from council import get_all_cached
     return get_all_cached().get("qualified", [])
 
