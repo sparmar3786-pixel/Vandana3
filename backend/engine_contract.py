@@ -1,7 +1,7 @@
 """Stable live-data contract for the NSE Algo terminal.
 
 This module is the single normalization layer used by Dashboard, Strategy Refresh
-and AI context. It never fabricates a market value.
+and live strategy context. It never fabricates a market value.
 """
 from __future__ import annotations
 import time
@@ -141,7 +141,7 @@ def strategy_state(client, eng, symbol):
             "angel_api": bool(getattr(client, "api", None)),
             "nse_engine": bool(nse),
             "official_nse_mcp": "server-side MCP adapter",
-            "internet": "AI web-search layer",
+            "internet": "not configured",
         },
     }
     if snap is None:
