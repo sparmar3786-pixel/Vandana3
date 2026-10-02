@@ -28,14 +28,14 @@ class _TerminalState extends State<Terminal> {
   static const screens = <String>[
     'Dashboard','Market','Commodity','Signals','OI Lab','Watchlist','Search',
     'Charts','Option Chain','News','Market Details','Angel API','NSE',
-    'NSE MCP','Data','Instruments','Settings','More','Strategies','AI Analysis','System Health'
+    'NSE MCP','Data','Instruments','Settings','More','Strategies','System Health'
   ];
   static const icons = <IconData>[
     Icons.dashboard, Icons.show_chart, Icons.precision_manufacturing,
     Icons.notifications_active, Icons.analytics, Icons.star, Icons.search,
     Icons.candlestick_chart, Icons.table_chart, Icons.article, Icons.info_outline,
     Icons.key, Icons.language, Icons.hub, Icons.storage, Icons.list_alt,
-    Icons.tune, Icons.more_horiz, Icons.schema, Icons.psychology, Icons.health_and_safety
+    Icons.tune, Icons.more_horiz, Icons.schema, Icons.health_and_safety
   ];
   int selected = 0;
   String backendUrl = 'https://nse-algo-backend-live-production.up.railway.app';
@@ -60,24 +60,10 @@ class _TerminalState extends State<Terminal> {
   List<dynamic> strategyRegistry = <dynamic>[];
   List<dynamic> strategyEvidence = <dynamic>[];
   bool strategyBusy = false;
-  bool aiBusy = false;
   bool terminalBusy = false;
-  bool aiCrossVerified = false;
-  String aiReason = '';
-  String aiLastRun = '';
-  String aiFinal = 'WAIT';
-  String aiError = '';
   Map<String,dynamic> diagnostics = <String,dynamic>{};
   Map<String,dynamic> latestAudit = <String,dynamic>{};
   bool diagnosticsBusy = false;
-  List<dynamic> aiProviders = <dynamic>[
-    {'id':'gpt56-luna','name':'GPT-5.6 Luna','model':'gpt-5.6-luna','configured':false,'status':'Server key required'},
-    {'id':'claude-sonnet','name':'Claude Sonnet 4.6','model':'claude-sonnet-4-6','configured':false,'status':'Server key required'},
-    {'id':'gpt56-sol','name':'GPT-5.6 Sol','model':'gpt-5.6-sol','configured':false,'status':'Server key required'},
-    {'id':'deepseek','name':'DeepSeek Chat','model':'deepseek-chat','configured':false,'status':'Server key required'},
-    {'id':'gemini-flash','name':'Gemini 2.5 Flash','model':'gemini-2.5-flash','configured':false,'status':'Server key required'},
-    {'id':'grok-4','name':'Grok 4','model':'grok-4','configured':false,'status':'Server key required'},
-  ];
   String optionFilter = 'NIFTY';
   String selectedComponentIndex = 'NIFTY';
   List<dynamic> indexComponents = <dynamic>[];
@@ -95,7 +81,6 @@ class _TerminalState extends State<Terminal> {
     super.initState();
     fetchTerminal();
     fetchStrategies();
-    fetchAIStatus();
     fetchDiagnostics();
     fetchIndexComponents('NIFTY');
     timer = Timer.periodic(const Duration(seconds: 5), (_) => fetchTerminal());
@@ -215,7 +200,6 @@ class _TerminalState extends State<Terminal> {
     if (selected == 16) return settingsPage();
     if (selected == 17) return morePage();
     if (selected == 18) return strategiesPage();
-    if (selected == 19) return aiAnalysisPage();
     if (selected == 20) return systemHealthPage();
     return dataPage(screens[selected]);
   }
@@ -924,198 +908,9 @@ class _TerminalState extends State<Terminal> {
     ),
   );
 
-  Future<void> fetchAIStatus() async {
-    try {
-      final r=await http.get(
-        Uri.parse(backendUrl+'/v1/ai/status'),
-        headers:<String,String>{'x-token':apiToken},
-      ).timeout(const Duration(seconds:8));
-      if(!mounted) return;
-      if(r.statusCode==200){
-        dynamic d;
-        try { d=jsonDecode(r.body); } catch (_) { d=null; }
-        if(d is Map && d['providers'] is List){
-          final incoming=(d['providers'] as List).whereType<Map>().toList();
-          final byId=<String,Map<String,dynamic>>{
-            for(final p in incoming) p['id'].toString():Map<String,dynamic>.from(p)
-          };
-          final merged=aiProviders.map((old){
-            final id=(old is Map?old['id']:'').toString();
-            return byId[id] ?? old;
-          }).toList();
-          for(final p in incoming){
-            final id=(p['id']??'').toString();
-            if(id.isNotEmpty && !merged.any((x)=>x is Map && x['id']==id)) merged.add(p);
-          }
-          setState(() { aiProviders=merged; aiError=''; });
-        }
-      } else {
-        setState(() => aiError='AI status HTTP '+r.statusCode.toString()+'. Provider cards remain available.');
-      }
-    } catch(e) {
-      if(mounted) setState(() => aiError='AI status unavailable: '+e.toString());
-    }
-  }
-
-  Future<void> runAIValidation() async {
-    if(aiBusy || !mounted) return;
-    setState(() {
-      aiBusy=true;
-      aiError='';
-      aiReason='Preparing fresh terminal data...';
-      aiCrossVerified=false;
-    });
-    try {
-      await fetchTerminal();
-      final payload=<String,dynamic>{
-        'terminal':terminalData ?? <String,dynamic>{},
-        'signal':signal ?? <String,dynamic>{},
-        'strategy_count':strategyRegistry.length,
-        'strategy_evidence':strategyEvidence.take(120).toList(),
-        'timestamp':DateTime.now().toIso8601String(),
-      };
-      if(mounted) setState(() => aiReason=terminalData==null && signal==null
-        ? 'Live terminal data is unavailable. The server will attempt its own current snapshot.'
-        : 'Submitting current market snapshot to all configured AI providers...');
-      final r=await http.post(
-        Uri.parse(backendUrl+'/v1/ai/validate'),
-        headers:<String,String>{'x-token':apiToken,'Content-Type':'application/json'},
-        body:jsonEncode({'payload':payload}),
-      ).timeout(const Duration(seconds:35));
-      if(!mounted) return;
-      dynamic d;
-      try { d=jsonDecode(r.body); } catch (_) { d=null; }
-      if(r.statusCode==200 && d is Map){
-        final incoming=d['providers'] is List ? d['providers'] as List : <dynamic>[];
-        setState((){
-          aiFinal=(d['final']??'WAIT').toString();
-          aiCrossVerified=d['cross_verified']==true;
-          aiReason=(d['reason']??'').toString();
-          aiLastRun=DateTime.now().toLocal().toString().substring(0,19);
-          if(incoming.isNotEmpty){
-            final byId=<String,Map<String,dynamic>>{
-              for(final p in incoming.whereType<Map>()) p['id'].toString():Map<String,dynamic>.from(p)
-            };
-            aiProviders=aiProviders.map((old){
-              final id=(old is Map?old['id']:'').toString();
-              return byId[id] ?? old;
-            }).toList();
-          }
-        });
-      } else {
-        setState(()=>aiError='AI validation HTTP '+r.statusCode.toString()+(d is Map && d['error']!=null ? ': '+d['error'].toString() : ''));
-      }
-    } catch(e) {
-      if(mounted) setState(()=>aiError='AI validation failed safely: '+e.toString());
-    } finally {
-      if(mounted) setState(() => aiBusy=false);
-    }
-  }
-
-  List<Widget> _aiProviderCards() {
-    final out=<Widget>[];
-    for(var i=0;i<aiProviders.length;i++){
-      final raw=aiProviders[i];
-      if(raw is Map) out.add(_aiProviderCard(i,raw));
-    }
-    return out;
-  }
-
-  Widget _aiProviderCard(int index, dynamic raw) {
-    final p=Map<String,dynamic>.from(raw as Map);
-    final ok=p['status']=='ok' || p['configured']==true;
-    final name=(p['name']??'AI Provider').toString();
-    final status=(p['status']??(p['configured']==true?'Ready':'Server key required')).toString();
-    final model=(p['model']??'').toString();
-    final body=(p['text']??p['error']??'Not run yet.').toString();
-    return Card(child:ExpansionTile(
-      leading:CircleAvatar(child:Icon(ok?Icons.check:Icons.key_off,size:18)),
-      title:Text((index+1).toString()+' • '+name,style:const TextStyle(fontWeight:FontWeight.bold)),
-      subtitle:Text(status),
-      trailing:Text(model,style:const TextStyle(fontSize:9)),
-      children:[
-        Padding(
-          padding:const EdgeInsets.fromLTRB(16,0,16,14),
-          child:Align(alignment:Alignment.centerLeft,child:Text(body,style:const TextStyle(fontSize:11,height:1.35))),
-        ),
-      ],
-    ));
-  }
-
-  Widget aiAnalysisPage() {
-    final configured=aiProviders.where((x)=>x is Map && x['configured']==true).length;
-    final c=terminalData?['connection'];
-    final terminalConnected=c is Map && c['angel']==true;
-    return RefreshIndicator(
-      onRefresh:fetchAIStatus,
-      child:ListView(
-        padding:const EdgeInsets.fromLTRB(12,10,12,24),
-        children:[
-          Row(children:[
-            const Expanded(child:Column(crossAxisAlignment:CrossAxisAlignment.start,children:[
-              Text('AI Analysis',style:TextStyle(fontSize:24,fontWeight:FontWeight.bold)),
-              SizedBox(height:3),
-              Text('6-AI server validation • no double-tap required • keys stay on backend',style:TextStyle(fontSize:11)),
-            ])),
-            IconButton(onPressed:fetchAIStatus,icon:const Icon(Icons.refresh)),
-          ]),
-          const SizedBox(height:10),
-          Card(child:Padding(padding:const EdgeInsets.all(14),child:Column(crossAxisAlignment:CrossAxisAlignment.start,children:[
-            const Text('LIVE INPUT',style:TextStyle(fontWeight:FontWeight.bold,letterSpacing:.7)),
-            const SizedBox(height:7),
-            Row(children:[
-              Icon(terminalConnected?Icons.cloud_done:Icons.cloud_off,size:18,color:terminalConnected?Colors.green:Colors.orange),
-              const SizedBox(width:7),
-              Expanded(child:Text(terminalConnected
-                ? 'Fresh Angel/terminal snapshot is available for AI validation.'
-                : 'Live terminal snapshot is not confirmed; server-side snapshot fallback remains enabled.')),
-            ]),
-            const SizedBox(height:5),
-            Text('Configured providers: $configured / 6',style:const TextStyle(fontSize:11)),
-          ]))),
-          const SizedBox(height:10),
-          Card(child:Padding(padding:const EdgeInsets.all(14),child:Column(crossAxisAlignment:CrossAxisAlignment.start,children:[
-            const Text('FINAL VALIDATION',style:TextStyle(fontWeight:FontWeight.bold,letterSpacing:.7)),
-            const SizedBox(height:8),
-            Row(children:[
-              Container(width:12,height:12,decoration:BoxDecoration(shape:BoxShape.circle,color:aiFinal=='CALL BUY'?Colors.green:aiFinal=='PUT BUY'?Colors.red:Colors.orange)),
-              const SizedBox(width:8),
-              Expanded(child:Text(aiFinal,style:const TextStyle(fontSize:22,fontWeight:FontWeight.w800))),
-              Icon(aiCrossVerified?Icons.verified:Icons.pending_outlined,color:aiCrossVerified?Colors.green:Colors.orange),
-            ]),
-            if(aiReason.isNotEmpty) Padding(padding:const EdgeInsets.only(top:6),child:Text(aiReason,style:const TextStyle(fontSize:11))),
-            if(aiLastRun.isNotEmpty) Padding(padding:const EdgeInsets.only(top:3),child:Text('Last run: $aiLastRun',style:const TextStyle(fontSize:10))),
-            const SizedBox(height:10),
-            SizedBox(width:double.infinity,child:FilledButton.icon(
-              onPressed:aiBusy?null:runAIValidation,
-              icon:aiBusy?const SizedBox(width:18,height:18,child:CircularProgressIndicator(strokeWidth:2)):const Icon(Icons.auto_awesome),
-              label:Text(aiBusy?'RUNNING 6-AI VALIDATION...':'RUN 6-AI VALIDATION'),
-            )),
-            if(aiError.isNotEmpty) Padding(padding:const EdgeInsets.only(top:8),child:Text(aiError,style:const TextStyle(color:Colors.red,fontSize:11))),
-          ]))),
-          const SizedBox(height:10),
-          Column(children:_aiProviderCards()),
-          const SizedBox(height:6),
-          infoCard(
-            configured==0?'AI server keys required':'AI server ready',
-            configured==0
-              ? 'Set provider API keys on the Render backend. The APK never stores them.'
-              : 'Tap RUN 6-AI VALIDATION. No market-card double-tap or hidden activation step is required.',
-            configured==0?Colors.orange:Colors.green,
-          ),
-          const SizedBox(height:6),
-          infoCard('Crash protection','Network calls are timeout-guarded, terminal polling is single-flight, malformed JSON is handled safely, and AI failures show an error instead of crashing the APK.',Colors.blue),
-          const SizedBox(height:6),
-          infoCard('Evidence rule','AI validates supplied market data only. Missing OI/volume/Greeks stays marked missing; no fabricated trade result or guaranteed win rate.',Colors.blue),
-        ],
-      ),
-    );
-  }
-
   Widget systemHealthPage() {
     final feeds = diagnostics['feeds'] is Map ? diagnostics['feeds'] as Map : <dynamic,dynamic>{};
     final strategies = diagnostics['strategies'] is Map ? diagnostics['strategies'] as Map : <dynamic,dynamic>{};
-    final ai = diagnostics['ai'] is Map ? diagnostics['ai'] as Map : <dynamic,dynamic>{};
     final angel = feeds['angel'] is Map ? feeds['angel'] as Map : <dynamic,dynamic>{};
     final nse = feeds['nse'] is Map ? feeds['nse'] as Map : <dynamic,dynamic>{};
     final mcp = feeds['nse_mcp'] is Map ? feeds['nse_mcp'] as Map : <dynamic,dynamic>{};
@@ -1147,9 +942,6 @@ class _TerminalState extends State<Terminal> {
           _healthTile('NSE data',
             nse['connected'] == true ? 'No current error' : 'Data error',
             nse['connected'] == true),
-          _healthTile('AI validation',
-            (ai['configured'] ?? 0).toString()+' / '+(ai['total'] ?? 0).toString()+' providers configured',
-            (ai['configured'] ?? 0) > 0),
           const SizedBox(height:8),
           Card(child:Padding(padding:const EdgeInsets.all(14),child:Column(
             crossAxisAlignment:CrossAxisAlignment.start,
