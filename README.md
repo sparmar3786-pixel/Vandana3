@@ -1,17 +1,19 @@
-# Angel One + NSE-AI OI Algo Terminal (Paper signals) — v2
+# VANDANA3 — Angel One + Official NSE MCP Algo Terminal
 
-## 1. Backend (PC / VPS)
+## 1. Canonical backend
 ```
 cd backend
 pip install -r requirements.txt
-cp .env.example .env      # apni Angel One details bharein
-python server.py
+cp .env.example .env      # fill server-side environment variables
+uvicorn server:app --host 0.0.0.0 --port 8000
 ```
-- SmartAPI app banayein: https://smartapi.angelone.in  -> API key
-- TOTP secret: Angel One par TOTP enable karte waqt milta hai
-- Market hours (9:15-15:30 IST) me signals chalte hain. `data/features.csv` me features log hote hain.
+- Angel credentials stay server-side: `ANGEL_API_KEY`, `ANGEL_CLIENT_CODE`, `ANGEL_PIN`, `ANGEL_TOTP_SECRET`.
+- The canonical API auto-reuses/login-refreshes the server-side Angel session before live data calls.
+- Official NSE Streamable HTTP MCP: `https://mcp.nseindia.in/cmmkt/mcp`.
+- No Angel credential, JWT, refresh token or feed token is stored in the APK.
+- Paper/read-only only: `orders_enabled=false`, `paper_only=true`.
 
-## NSE AI (v2 badlav)
+## Official NSE + AI evidence
 - `nse_client.py` nseindia.com/option-chain ka wahi JSON leta hai (option-chain-v3, fallback option-chain-indices) har NSE_POLL_SEC (60s).
 - `nse_features.py`: PCR, OI change imbalance, per-strike buildup (Long/Short buildup, Short covering, Long unwinding), support/resistance (max PE/CE OI), max pain, IV skew, poll-to-poll OI momentum.
 - AI trend = sirf NSE features par. Model na ho to NSE rule-trend chalta hai; `data/nse_features.csv` me log hota hai.
@@ -20,7 +22,7 @@ python server.py
 
 ## Angel One SmartAPI connection (Vandana2)
 
-The APK uses the Vandana2 backend endpoint `/v1/angel/login`. The backend follows Angel One's documented `loginByPassword` flow:
+The APK uses the canonical backend endpoint `/v1/angel/login`. The backend follows Angel One's documented `loginByPassword` flow:
 
 1. Client ID + PIN/MPIN + current 6-digit TOTP + SmartAPI API key.
 2. Backend calls Angel One `/rest/auth/angelbroking/user/v1/loginByPassword`.
@@ -57,4 +59,4 @@ PUT side me direction ulta. Score = 0.5*OI + 0.3*EMA trend + 0.2*PCR. Entry ATM 
 Order placement intentionally nahi hai. Pehle paper trade + backtest karein. Profit guaranteed nahi.
 
 
-Baseline: Vandana1 Build 156 process copied into Vandana2; legacy terminal implementation removed from the active source tree.
+PDF connection contract implemented in Vandana3: server-side Angel auto-connection, `/v1/angel/*` market endpoints, official NSE MCP tools/context/CSV endpoints, combined `/v1/ai/context`, `/v1/ws`, and read-only/paper protection. A duplicate backend entrypoint was removed so `backend/server.py` is the single API entrypoint.
