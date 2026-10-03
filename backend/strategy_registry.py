@@ -30,7 +30,7 @@ _GROUPS = [
 ("Data / Reliability", """Timestamp Chronology|Data Freshness|Timestamp Synchronization|Missing Tick Detection|Abnormal Tick Detection|Data Gap Detection|Duplicate Tick Detection|API Latency Monitor|Feed Recovery Detection|Market-Status Validation|Exchange-Mismatch Protection|Invalid Strike Protection|Missing OI Protection|Missing Volume Protection|Stale Quote Block"""),
 ("Backtest / Validation", """Strategy-wise Backtest|Index-wise Backtest|CE-vs-PE Backtest|Expiry-vs-Non-expiry Backtest|Time-window Backtest|Strike-distance Backtest|Market-regime Backtest|Walk-Forward Testing|Out-of-Sample Testing|Monte-Carlo Trade Sequence Analysis|Parameter Sensitivity|Strategy Robustness Test|Slippage Sensitivity|Transaction-Cost Sensitivity|Forward Paper Validation|Live-vs-Backtest Drift Detection|Maximum Drawdown|Average R|Expectancy|Profit Factor|Consecutive Wins/Losses|Time-of-Day Performance"""),
 
-("Final Decision Engine", """CALL Qualification|PUT Qualification|CALL vs PUT Conflict|Opposite-Side Override|Liquidity Gate|Risk/R:R Gate|Data-Quality Gate|Confidence/Confirmation Gate|Final WAIT|NO QUALIFYING TRADE"""),
+("Final Decision Engine", """CALL Qualification|PUT Qualification|CALL vs PUT Conflict|Opposite-Side Override|Liquidity Gate|Risk/R:R Gate|Data-Quality Gate|Confidence/Confirmation Gate|Final WAIT|NO QUALIFYING TRADE|PCR Strategy|Max Pain Strategy|OI PCR Divergence|VWAP + OI Confirmation|EMA + VWAP Confirmation|ATR Target Strategy|Bollinger Mean-Reversion|MACD + OI Confirmation|Delta + OI Confirmation|Gamma Wall Strategy|IV Skew Reversal|News Risk Gate|Timeframe Consensus"""),
 ]
 
 def _make_registry():
@@ -61,7 +61,7 @@ for _family, _raw in _ADVANCED:
         _j += 1
 ALL_STRATEGIES = STRATEGIES + ADVANCED_STRATEGIES
 if len(ADVANCED_STRATEGIES) != 49 or len(ALL_STRATEGIES) != 426:
-    raise RuntimeError("Advanced registry must contain 47 modules; total must be 424")
+    raise RuntimeError("Advanced registry must contain 49 modules; total must be 426")
 
 def _num(x):
     try: return float(x)
