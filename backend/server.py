@@ -22,8 +22,8 @@ app=FastAPI(title="NSE Algo Signal API"); app.add_middleware(GZipMiddleware,mini
 state={"error":None,"nse_error":None,"last_update":None,"angel_message":"Not connected","nse_mcp_error":None,"nse_mcp_checked":False}
 prev_chain={"c":None}; workers_started=False; last_oi_save=0.0
 
-# Two read-only MCP servers live in this same Railway/Fly process.
-# /mcp serves the shared market snapshot; /mcp-strategy serves strategy evidence/backtests.
+# Two read-only MCP adapters are mounted in this single canonical API process.
+# /mcp serves shared market evidence; /mcp-strategy serves strategy evidence/backtests.
 mount_mcp(app)
 mount_strategy_mcp(app)
 install_mcp_auth(app)
@@ -162,8 +162,23 @@ async def native_market_websocket(websocket: WebSocket):
 
 
 def angel_required():
+    # Canonical PDF architecture: every live-data endpoint uses the same
+    # server-side Angel session. If it is missing, try one automatic login
+    # from ANGEL_API_KEY / ANGEL_CLIENT_CODE / ANGEL_PIN / ANGEL_TOTP_SECRET.
+    try:
+        _ensure_angel()
+    except Exception as e:
+        state["error"]=str(e)
+        state["angel_message"]="Angel connection failed."
+        client.api=None
     if client.api is None:
-        raise HTTPException(503,"Angel One is not connected. Connect from Angel API screen first.")
+        raise HTTPException(
+            503,
+            detail={
+                "code":"ANGEL_NOT_CONNECTED",
+                "message":"Angel One is not connected. Configure server-side ANGEL_* credentials or use the Angel API login endpoint."
+            },
+        )
 
 @app.get("/v1/angel/commodities")
 def angel_commodities(x_token:str=Header(None)):
@@ -271,6 +286,59 @@ def angel_greeks(name:str="NIFTY",expiry:str="",x_token:str=Header(None)):
     if not expiry: raise HTTPException(400,"Expiry is required")
     try: return client.option_greeks(name,expiry)
     except Exception as e: raise HTTPException(502,str(e))
+
+@app.get("/v1/ai/context")
+def ai_context(index:str="NIFTY",x_token:str=Header(None)):
+    """Combined read-only evidence required by the PDF connection contract."""
+    auth(x_token)
+    symbol=str(index or "NIFTY").upper().replace(" ","")
+    # Angel evidence: use the same server-side session as every other live endpoint.
+    angel_data={}
+    try:
+        _ensure_angel()
+        if client.api is not None:
+            angel_data=engine_state(client,eng,symbol)
+    except Exception:
+        angel_data={}
+    # Official NSE MCP evidence: zero tools/unavailable is surfaced, never fabricated.
+    try:
+        nse_mcp_data=nse_mcp.context(symbol)
+        state["nse_mcp_checked"]=True
+        state["nse_mcp_error"]=None
+    except Exception as e:
+        nse_mcp_data={"connected":False,"endpoint":nse_mcp.url,"tool_count":0,
+                      "tools":[],"data":[],"tool_errors":[{"error":str(e)[:300]}],
+                      "option_chain_tool_available":False}
+        state["nse_mcp_checked"]=True
+        state["nse_mcp_error"]=str(e)
+    # NSE internet evidence comes from the repository's read-only NSE adapter.
+    internet={}
+    try:
+        if market_open():
+            chain=nse.fetch(symbol)
+            internet={"connected":True,"source":"NSE website","data":chain}
+        else:
+            internet={"connected":False,"source":"NSE website","message":"Market closed"}
+    except Exception as e:
+        internet={"connected":False,"source":"NSE website","error":str(e)[:300]}
+    evidence=market_evidence(symbol)
+    return {
+        "index":symbol,
+        "terminal":terminal_snapshot(),
+        "strategy":strategy_state(client,eng,symbol),
+        "data_layer":evidence,
+        "three_sources":{
+            "angel_api":angel_data,
+            "official_nse_mcp":nse_mcp_data,
+            "official_nse_internet":internet,
+        },
+        "market_evidence":evidence,
+        "safety":{
+            "paper_only":True,
+            "orders_enabled":False,
+            "conflict_policy":"Missing or conflicting evidence can force WAIT.",
+        },
+    }
 
 @app.get("/v1/mcp/status")
 def mcp_status(x_token:str=Header(None)):
